@@ -192,7 +192,7 @@ export default function (pi: ExtensionAPI) {
     name: "spawn_agent",
     label: "Spawn Agent",
     get description() {
-      return `Spawn a fresh-context Pi subagent for a concrete task. Automatic extension, skill, and prompt-template discovery is disabled. Agent templates may explicitly configure a provider/model pair, thinking level, tools, skills, and extensions. Omitted template settings inherit from the parent where applicable.
+      return `Spawn a fresh-context Pi subagent for a concrete task. Automatic extension, skill, and prompt-template discovery is disabled. Agent templates may configure a model with an optional provider, thinking level, tools, skills, and extensions. A template model without a provider uses the current parent provider at spawn; without a model, both provider and model inherit (provider-only templates do not reroute). A caller model overrides the template route. Exact registered provider/model IDs are required, and any provider extension must be explicitly loaded in the child. Other omitted template settings inherit from the parent where applicable.
 ${spawnModels.size ? `
 A task may run on a model of its own, without a template: \`model\` takes one of the values its schema lists, and \`thinking\` sets the reasoning effort.
 ` : ""}

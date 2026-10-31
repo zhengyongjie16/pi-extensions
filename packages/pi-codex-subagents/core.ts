@@ -149,6 +149,7 @@ interface LiveAgent {
   expectedExit: boolean;
   processFinished: boolean;
   finalizedRun: boolean;
+  awaitingPrompt: boolean;
   exitPromise: Promise<void>;
   resolveExit: () => void;
   termination?: Promise<void>;
@@ -471,8 +472,8 @@ export function parseAgentDefinitionText(text: string, fallbackName: string): Ag
     name: attrs.name || fallbackName,
     description: attrs.description,
     hint: attrs.hint || attrs.caller_hint,
-    provider: attrs.provider,
-    model: attrs.model,
+    provider: attrs.provider?.trim() || undefined,
+    model: attrs.model?.trim() || undefined,
     thinking: isThinkingLevel(attrs.thinking) ? attrs.thinking : undefined,
     tools: attrs.tools,
     skills: stringList(attrs.skills),
@@ -502,7 +503,7 @@ export function getAgentDefinitionsDescription(): string {
   if (!definitions.length) return "None configured, so omit `agent_type`.";
   return definitions.map((definition) => {
     let line = `- \`${definition.name}\`${definition.description ? ` — ${definition.description}` : ""}`;
-    if (definition.provider && definition.model) line += ` — model: ${definition.provider}/${definition.model}`;
+    if (definition.model) line += ` — model: ${definition.provider ? `${definition.provider}/${definition.model}` : `${definition.model} (inherited provider)`}`;
     if (definition.thinking) line += ` — thinking: ${definition.thinking}`;
     if (definition.extensions?.length) line += ` — extensions: ${definition.extensions.join(", ")}`;
     return definition.hint ? `${line}\n  Caller hint: ${definition.hint}` : line;
@@ -1145,7 +1146,7 @@ export class AgentManager {
     const taskName = normalizeTaskName(params.task_name);
     const definition = getAgentDefinition(params.agent_type);
     if (params.agent_type && !definition) throw new Error(`Agent template not found: ${params.agent_type}`);
-    const templateModel = definition?.provider && definition.model ? { provider: definition.provider, modelId: definition.model } : undefined;
+    const templateModel = definition?.model ? { provider: definition.provider ?? params.inheritedProvider, modelId: definition.model } : undefined;
     const { provider, modelId } = params.model ?? templateModel ?? { provider: params.inheritedProvider, modelId: params.inheritedModelId };
     const config = loadSubagentConfig();
     readSystemPrompt();
@@ -1228,6 +1229,7 @@ export class AgentManager {
   }
 
   private async startLiveAgent(info: AgentInfo, initialMessage?: string, displayMessage?: string): Promise<LiveAgent> {
+    if (this.live.has(info.id)) throw new Error(`Agent ${info.canonicalName} already has a live child. Retry after startup finishes.`);
     readSystemPrompt();
     if (info.status !== "starting" && info.status !== "running") {
       this.notifyStatusChange({ ...info, status: "starting", lastActivity: Date.now() });
@@ -1284,6 +1286,8 @@ export class AgentManager {
       expectedExit: false,
       processFinished: false,
       finalizedRun: false,
+      // Persisted final metadata still belongs to the previous run until a new prompt begins.
+      awaitingPrompt: true,
       exitPromise,
       resolveExit,
       candidateResponse: "",
@@ -1296,7 +1300,7 @@ export class AgentManager {
       this.clearModelResponseTimer(live);
       live.processFinished = true;
       const persisted = readInfoFile(live.info.infoFile);
-      if (persisted && FINAL_STATUSES.has(persisted.status)) {
+      if (!live.awaitingPrompt && persisted && FINAL_STATUSES.has(persisted.status)) {
         live.info = persisted;
         live.finalizedRun = true;
       }
@@ -1305,7 +1309,7 @@ export class AgentManager {
         pending.reject(error ?? new Error("Child Pi process exited before responding."));
         live.pending.delete(requestId);
       }
-      if (!live.expectedExit && !live.finalizedRun && !FINAL_STATUSES.has(live.info.status)) {
+      if (!live.expectedExit && !live.finalizedRun) {
         this.markFailed(live, error?.message ?? "Child Pi process exited unexpectedly.");
       }
       const ownership = live.info.childProcess;
@@ -1337,7 +1341,7 @@ export class AgentManager {
       logger.info("stdin", "child stdin error", { error: error.message });
       if (!live.expectedExit) {
         const persisted = readInfoFile(live.info.infoFile);
-        if (persisted && FINAL_STATUSES.has(persisted.status)) {
+        if (!live.awaitingPrompt && persisted && FINAL_STATUSES.has(persisted.status)) {
           live.info = persisted;
           live.finalizedRun = true;
         } else if (!live.finalizedRun) {
@@ -1355,7 +1359,17 @@ export class AgentManager {
 
     try {
       if (!proc.pid) throw new Error("Child Pi process did not provide a PID.");
-      await this.sendCommand(live, { type: "get_state" }, DEFAULT_STARTUP_TIMEOUT_MS);
+      // CLI lookup can fuzzy-match or accept unregistered IDs; verify the child after extensions load.
+      const state = await this.sendCommand(live, { type: "get_state" }, DEFAULT_STARTUP_TIMEOUT_MS);
+      const available = await this.sendCommand(live, { type: "get_available_models" }, DEFAULT_STARTUP_TIMEOUT_MS);
+      const target = `${info.provider}/${info.modelId}`;
+      if (!Array.isArray(available?.models) || !available.models.some((model: any) => model?.provider === info.provider && model.id === info.modelId)) {
+        throw new Error(`Child Pi model "${target}" is not registered in get_available_models. Use exact provider/model IDs and explicitly load any required provider extension.`);
+      }
+      if (state?.model?.provider !== info.provider || state?.model?.id !== info.modelId) {
+        const selected = state?.model?.provider && state.model.id ? `"${state.model.provider}/${state.model.id}"` : "no model";
+        throw new Error(`Child Pi model "${target}" was requested, but get_state selected ${selected}. Exact provider/model selection is required.`);
+      }
       let snapshot: ProcessSnapshot | undefined;
       for (let attempt = 0; attempt < 20 && !snapshot; attempt++) {
         snapshot = inspectProcess(proc.pid, childToken);
@@ -1374,7 +1388,8 @@ export class AgentManager {
       if (initialMessage) await this.prompt(live, initialMessage, displayMessage);
       return live;
     } catch (error) {
-      if (!live.finalizedRun) this.markFailed(live, error instanceof Error ? error.message : String(error));
+      const message = formatAgentError(error);
+      if (!live.finalizedRun) this.markFailed(live, message);
       await this.terminateProcess(live);
       throw error;
     }
@@ -1411,6 +1426,7 @@ export class AgentManager {
     const targets = this.defaultWaitAllTargets.get(live.info.parentSessionId) ?? new Set<string>();
     targets.add(live.info.canonicalName);
     this.defaultWaitAllTargets.set(live.info.parentSessionId, targets);
+    live.awaitingPrompt = false;
     live.info.status = "running";
     live.info.lastTaskMessage = displayMessage ?? message;
     live.info.lastActivity = Date.now();
@@ -1486,7 +1502,7 @@ export class AgentManager {
     const highFrequencyUpdate = event.type === "message_update" || event.type === "tool_execution_update";
     if (!highFrequencyUpdate) {
       const persisted = readInfoFile(live.info.infoFile);
-      if (persisted && FINAL_STATUSES.has(persisted.status) && persisted.status !== live.info.status) {
+      if (!live.awaitingPrompt && persisted && FINAL_STATUSES.has(persisted.status) && persisted.status !== live.info.status) {
         live.info = persisted;
         live.finalizedRun = true;
         return;
@@ -1762,14 +1778,17 @@ export class AgentManager {
     await this.reconciliation;
     let info = this.getAgentInfo(target, parentSessionId);
     let live = this.live.get(info.id);
-    if (live?.expectedExit) {
-      await live.termination;
-      live = undefined;
+    while (true) {
+      if (live?.awaitingPrompt) throw new Error(`Agent ${info.canonicalName} is still starting. Retry after startup finishes.`);
+      if (live?.expectedExit) await live.termination;
+      else if (!live && info.childProcess) await this.terminateOwnedChild(info);
+      else break;
+      // Cleanup yielded: another caller may now own a fresh child, so recheck readiness.
       info = this.getAgentInfo(target, parentSessionId);
+      live = this.live.get(info.id);
     }
     const wasLive = Boolean(live);
     if (!live) {
-      if (info.childProcess) await this.terminateOwnedChild(info);
       if (info.status === "starting" || info.status === "running") {
         info.status = "interrupted";
         info.lastActivity = Date.now();
@@ -1863,10 +1882,10 @@ export class AgentManager {
     await this.reconciliation;
     const terminations: Promise<void>[] = [];
     for (const live of this.live.values()) {
+      live.finalizedRun = true;
       if (live.info.status === "starting" || live.info.status === "running") {
         live.info.status = "interrupted";
         live.info.lastActivity = Date.now();
-        live.finalizedRun = true;
         saveInfo(live.info);
         this.notifyStatusChange(live.info);
       }

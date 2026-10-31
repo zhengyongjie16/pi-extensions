@@ -5,6 +5,19 @@ import * as readline from "node:readline";
 
 const sessionIndex = process.argv.indexOf("--session");
 const sessionFile = sessionIndex >= 0 ? process.argv[sessionIndex + 1] : undefined;
+const requestedModel = {
+  provider: process.argv[process.argv.indexOf("--provider") + 1],
+  id: process.argv[process.argv.indexOf("--model") + 1],
+};
+// Fixed fixture routes, never populated from arbitrary CLI arguments.
+const models = [
+  { provider: "test", id: "fake" },
+  { provider: "test", id: "template-model" },
+  { provider: "template-provider", id: "template-model" },
+  { provider: "openai", id: "gpt-5" },
+  { provider: "fireworks", id: "accounts/fireworks/models/glm-5p2" },
+];
+const modelResponses = JSON.parse(process.env.PI_SUBAGENT_TEST_MODEL_RESPONSES || "{}");
 
 function record(value) {
   if (sessionFile) fs.appendFileSync(sessionFile, `${JSON.stringify({ pid: process.pid, ...value })}\n`);
@@ -18,8 +31,13 @@ record({ type: "started", args: process.argv.slice(2) });
 const input = readline.createInterface({ input: process.stdin });
 input.on("line", (line) => {
   const command = JSON.parse(line);
-  if (command.type === "get_state") {
-    send({ type: "response", id: command.id, success: true, data: {} });
+  if (command.type !== "prompt") record({ type: command.type });
+  if (modelResponses.exitOn === command.type) process.exit(23);
+  if (modelResponses.holdOn === command.type) return;
+  if (command.type === "get_state" || command.type === "get_available_models") {
+    const key = command.type === "get_state" ? "state" : "availableModels";
+    const data = Object.hasOwn(modelResponses, key) ? modelResponses[key] : key === "state" ? { model: requestedModel } : { models };
+    send({ type: "response", id: command.id, success: true, data });
     return;
   }
   if (command.type === "prompt") {

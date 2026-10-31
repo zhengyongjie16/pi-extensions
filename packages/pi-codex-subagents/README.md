@@ -55,13 +55,29 @@ hint: Give this reviewer exact file paths and a narrow scope.
 You are a focused review subagent. Return concise findings with file paths.
 ```
 
-`provider` and `model` are an optional pair. When both are present, Pi launches that exact provider/model combination. If either is absent, the child inherits the parent agent's provider and model. `thinking` is also optional and otherwise inherits the parent. Template `tools` override inherited tool names.
+A template may set `model` without `provider` to use the current parent's provider at spawn time:
+
+```md
+---
+name: quick-reviewer
+model: gpt-5.6-sol
+---
+Review the requested files concisely.
+```
+
+Model routing priority is:
+
+1. A caller-requested `model` (a complete provider/model pair).
+2. The template's `model`, using its `provider` when present, otherwise the current parent's provider.
+3. The current parent's provider and model.
+
+Blank or whitespace-only template `provider`/`model` values count as omitted. A template without a model, including a provider-only template, still inherits **both** parent values; a provider alone does not reroute. `thinking` is independent and otherwise inherits the parent. Template `tools` override inherited tool names.
 
 `skills` may contain skill names or paths. `extensions` may contain local files/directories or npm package names already installed by Pi. Package names are resolved from project-local packages first and then Pi's global npm directory. Missing packages are never installed automatically.
 
 When a template loads extensions but omits `tools`, the child uses Pi's normal tool activation so tools registered by those extensions are available. Set template `tools` when you want an explicit allowlist. Without configured extensions, omitted template tools inherit the parent's active tool names as before.
 
-Automatic extension, skill, prompt-template, and context-file discovery is disabled in children. `AGENTS.md` and `CLAUDE.md` files are never loaded. Each child replaces Pi's default coding prompt with the contents of `~/.pi/agent/pi-codex-subagents/SYSTEM.md`, while only explicitly configured skills and extensions load. This file is created with a minimal subagent prompt when the extension first loads and can be edited directly. If the inherited parent model comes from an extension-registered provider, add that provider extension to the selected template; otherwise the isolated child cannot resolve the provider.
+Automatic extension, skill, prompt-template, and context-file discovery is disabled in children. `AGENTS.md` and `CLAUDE.md` files are never loaded. Each child replaces Pi's default coding prompt with the contents of `~/.pi/agent/pi-codex-subagents/SYSTEM.md`, while only explicitly configured skills and extensions load. This file is created with a minimal subagent prompt when the extension first loads and can be edited directly. If the selected model comes from an extension-registered provider, explicitly load that provider extension through the template's `extensions` or configured defaults; the parent's loaded extensions are not inherited.
 
 ## Configuration
 
@@ -114,7 +130,9 @@ The arguments are offered only when at least one allowed model is available, and
 
 The list is resolved when a session starts: `models` entries are filtered to what is currently available, unavailable entries are reported as a warning notification, and the scoped models are merged in. Editing the configuration or the Pi setting takes effect when the next session starts, matching the `storageDir` and `retentionDays` behavior above. If a provider drops out mid-session, `spawn_agent` refuses that model at spawn time instead of serving a stale route.
 
-An allowed model may belong to an extension-registered provider. Route to one only from a template that loads that provider extension, since children load none of their own.
+Every route must use exact registered provider/model IDs, including any slashes in the model ID. Fuzzy names and unregistered custom IDs are not accepted. Before any task prompt, the child must advertise the exact resolved pair in its available model registry and report that exact selected model. Missing or mismatched models fail startup and terminate the child; there is no fallback or provider search. Validation uses the child's registry, not the parent's, so explicitly loaded provider extensions can register models there.
+
+The resolved provider/model pair is saved at spawn. `send_message` restarts reuse and revalidate that saved pair, even if the parent model or template has since changed. These are read-only local RPC checks, not network probes. Registration cannot guarantee that a remote backend actually serves an advertised model; backend rejection still occurs at the first request.
 
 A thinking level written into an `enabledModels` pattern, such as `anthropic/claude-opus-4-6:high`, is ignored here. `thinking` stays a separate argument, and the child clamps it to what its model supports.
 
@@ -130,7 +148,7 @@ While agents are starting or running, a compact one-line indicator appears above
 
 The overlay uses the child working directory for tool rendering and synchronizes in-progress output when opened midway through a run. Use Left/Right to switch between agents in the current browser scope.
 
-Child RPC processes are terminated after completion, failure, or interruption so settled agents do not keep consuming memory. `send_message` starts a fresh child process with the persisted session and continues from there. On startup, the extension also reconciles and terminates validated owned children left behind by an earlier extension process.
+Child RPC processes are terminated after completion, failure, or interruption so settled agents do not keep consuming memory. `send_message` starts a fresh child process with the persisted session and continues from there. Concurrent messages arriving while a child is starting are rejected; retry after startup finishes. On startup, the extension also reconciles and terminates validated owned children left behind by an earlier extension process.
 
 ## Output limits
 

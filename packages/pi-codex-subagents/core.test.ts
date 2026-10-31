@@ -35,6 +35,7 @@ const {
   consumeFirstMatchingMailboxEvent,
   formatAgentError,
   getAgent,
+  getAgentDefinitionsDescription,
   getRunsDir,
   getSocketPath,
   loadSubagentConfig,
@@ -131,6 +132,39 @@ Review the requested files.`, "fallback");
       skills: ["web-investigate"],
       prompt: "Review the requested files.",
     });
+  });
+
+  test("trims routing values and treats blank values as omitted", () => {
+    expect(parseAgentDefinitionText(`---
+provider: "  openai  "
+model: '  accounts/team/model  '
+---`, "trimmed")).toMatchObject({ provider: "openai", model: "accounts/team/model" });
+    expect(parseAgentDefinitionText(`---
+provider: "   "
+model: '   '
+---`, "blank")).toMatchObject({ provider: undefined, model: undefined });
+  });
+
+  test("describes full pairs and model-only routes without advertising provider-only routing", () => {
+    const directory = path.join(TEST_AGENT_DIR, "pi-codex-subagents", "agents");
+    const templates = {
+      "description-full": 'provider: " template-provider "\nmodel: " template-model "',
+      "description-model-only": 'provider: "   "\nmodel: template-model\nthinking: medium',
+      "description-provider-only": 'provider: template-provider\nmodel: "   "',
+    };
+    fs.mkdirSync(directory, { recursive: true });
+    try {
+      for (const [name, fields] of Object.entries(templates)) {
+        fs.writeFileSync(path.join(directory, `${name}.md`), `---\nname: ${name}\n${fields}\n---\n`);
+      }
+      const description = getAgentDefinitionsDescription();
+      expect(description).toContain("- `description-full` — model: template-provider/template-model");
+      expect(description).toContain("- `description-model-only` — model: template-model (inherited provider) — thinking: medium");
+      expect(description.split("\n").find((line) => line.startsWith("- `description-provider-only`")))
+        .toBe("- `description-provider-only`");
+    } finally {
+      for (const name of Object.keys(templates)) fs.rmSync(path.join(directory, `${name}.md`), { force: true });
+    }
   });
 });
 
@@ -325,6 +359,8 @@ describe("spawn model and thinking resolution", () => {
     const templateFile = path.join(TEST_AGENT_DIR, "pi-codex-subagents", "agents", "routed.md");
     fs.mkdirSync(path.dirname(templateFile), { recursive: true });
     fs.writeFileSync(templateFile, "---\nname: routed\nprovider: template-provider\nmodel: template-model\nthinking: medium\n---\nRouted template.");
+    const modelOnlyFile = path.join(path.dirname(templateFile), "caller-priority.md");
+    fs.writeFileSync(modelOnlyFile, "---\nname: caller-priority\nmodel: unregistered-template-model\n---\n");
     const manager = new AgentManager();
     const spawn = async (task: string, overrides: Record<string, unknown>) => {
       await manager.spawnAgent({ ...spawnParams(parentSessionId, task, "work"), inheritedThinking: "low", ...overrides });
@@ -337,6 +373,7 @@ describe("spawn model and thinking resolution", () => {
       expect(await spawn("caller-thinking", { thinking: "max" })).toMatchObject({ model: "test:fake", thinking: "max" });
       expect(await spawn("template", { agent_type: "routed" })).toMatchObject({ model: "template-provider:template-model", thinking: "medium" });
       expect(await spawn("caller-beats-template", { agent_type: "routed", ...callerModel, thinking: "xhigh" })).toMatchObject({ model: "openai:gpt-5", thinking: "xhigh" });
+      expect(await spawn("caller-beats-model-only", { agent_type: "caller-priority", ...callerModel })).toMatchObject({ model: "openai:gpt-5", thinking: "low" });
       // No level requested anywhere, not even by the parent, falls back to the package default.
       await manager.spawnAgent(spawnParams(parentSessionId, "default-thinking", "work"));
       expect(manager.getAgentInfo("default-thinking", parentSessionId)).toMatchObject({ model: "test:fake", thinking: "high" });
@@ -344,12 +381,361 @@ describe("spawn model and thinking resolution", () => {
     } finally {
       await manager.shutdown();
       fs.rmSync(templateFile, { force: true });
+      fs.rmSync(modelOnlyFile, { force: true });
+      delete process.env.PI_SUBAGENT_PI_BIN;
+    }
+  });
+
+  test.each([
+    ["model-only", "model: template-model", "test", "template-model"],
+    ["blank-provider", 'provider: "   "\nmodel: template-model', "test", "template-model"],
+    ["trimmed-pair", 'provider: " template-provider "\nmodel: " template-model "', "template-provider", "template-model"],
+    ["provider-only", "provider: template-provider", "test", "fake"],
+    ["blank-model", 'provider: template-provider\nmodel: "   "', "test", "fake"],
+    ["empty-model", "provider: template-provider\nmodel:", "test", "fake"],
+    ["blank-both", 'provider: "   "\nmodel: "   "', "test", "fake"],
+  ])("resolves %s without changing inherited thinking", async (name, fields, provider, modelId) => {
+    process.env.PI_SUBAGENT_PI_BIN = FAKE_RPC_CHILD;
+    const parentSessionId = `template-resolution-${name}`;
+    const scope = path.join(getRunsDir(), parentScopeKey(parentSessionId));
+    const templateFile = path.join(TEST_AGENT_DIR, "pi-codex-subagents", "agents", `${name}.md`);
+    const manager = new AgentManager();
+    fs.writeFileSync(templateFile, `---\nname: ${name}\n${fields}\n---\n`);
+    try {
+      await manager.spawnAgent({ ...spawnParams(parentSessionId, "worker", "hold routing"), agent_type: name, inheritedThinking: "xhigh" });
+      expect(manager.getAgentInfo("worker", parentSessionId)).toMatchObject({
+        provider, modelId, model: `${provider}:${modelId}`, thinking: "xhigh",
+      });
+    } finally {
+      await manager.shutdown();
+      fs.rmSync(templateFile, { force: true });
+      fs.rmSync(scope, { recursive: true, force: true });
       delete process.env.PI_SUBAGENT_PI_BIN;
     }
   });
 });
 
+describe("child model validation", () => {
+  const invalidRoutes: Array<[string, string, string, Record<string, unknown>, string]> = [
+    ["unknown-provider", "unknown-provider", "fake", {}, "not registered"],
+    ["unknown-id", "test", "not-registered", {}, "not registered"],
+    ["case-sensitive-id", "test", "Fake", {}, "not registered"],
+    ["fuzzy-id", "openai", "gpt", { state: { model: { provider: "openai", id: "gpt-5" } } }, "not registered"],
+    ["custom-unregistered", "openai", "custom/unregistered", {}, "not registered"],
+    ["missing-catalog", "test", "fake", { availableModels: {} }, "not registered"],
+    ["malformed-catalog", "test", "fake", { availableModels: { models: {} } }, "not registered"],
+    ["empty-catalog", "test", "fake", { availableModels: { models: [] } }, "not registered"],
+    ["crossed-pairs", "test", "fake", { availableModels: { models: [null, {}, { provider: "test", id: "other" }, { provider: "other", id: "fake" }] } }, "not registered"],
+    ["no-selected-model", "test", "fake", { state: {} }, "get_state selected no model"],
+    ["missing-state", "test", "fake", { state: null }, "get_state selected no model"],
+    ["selected-provider-mismatch", "test", "fake", { state: { model: { provider: "other", id: "fake" } } }, 'get_state selected "other/fake"'],
+    ["selected-id-mismatch", "test", "fake", { state: { model: { provider: "test", id: "template-model" } } }, 'get_state selected "test/template-model"'],
+  ];
+
+  test.each(invalidRoutes)("rejects %s before any prompt and cleans up the child", async (name, provider, modelId, responses, reason) => {
+    process.env.PI_SUBAGENT_PI_BIN = FAKE_RPC_CHILD;
+    process.env.PI_SUBAGENT_TEST_MODEL_RESPONSES = JSON.stringify(responses);
+    const parentSessionId = `invalid-route-${name}`;
+    const scope = path.join(getRunsDir(), parentScopeKey(parentSessionId));
+    const templateFile = path.join(TEST_AGENT_DIR, "pi-codex-subagents", "agents", `${name}.md`);
+    const completions: any[] = [];
+    const manager = new AgentManager({ onUnclaimedCompletion: (event) => completions.push(event) });
+    fs.writeFileSync(templateFile, `---\nname: ${name}\nprovider: ${provider}\nmodel: ${modelId}\n---\n`);
+    try {
+      const target = `${provider}/${modelId}`;
+      await expect(manager.spawnAgent({ ...spawnParams(parentSessionId, "worker", "must not run"), agent_type: name }))
+        .rejects.toThrow(target);
+      const failed = manager.getAgentInfo("worker", parentSessionId);
+      expect(failed).toMatchObject({ provider, modelId, status: "failed", messageCount: 0 });
+      expect(failed.error).toContain(reason);
+      expect(failed.finalResponse).toBeUndefined();
+      expect(failed.childProcess).toBeUndefined();
+      const records = fs.readFileSync(failed.sessionFile, "utf8").trim().split("\n").map((line) => JSON.parse(line));
+      expect(records.filter((entry) => entry.type === "prompt" || entry.type === "set_model")).toEqual([]);
+      expect(records.some((entry) => entry.type === "get_available_models")).toBe(true);
+      expect(pidAlive(records.find((entry) => entry.type === "started").pid)).toBe(false);
+      if (process.platform !== "win32") expect(fs.existsSync(getSocketPath(failed.id))).toBe(false);
+      const markerDirectory = path.join(process.env.PI_SUBAGENT_TEMP_DIR!, "pi-codex-subagents", os.userInfo().username, "sockets");
+      expect(fs.existsSync(path.join(markerDirectory, `${failed.id}.active.json`))).toBe(false);
+      expect(completions).toEqual([expect.objectContaining({ status: "failed", error: failed.error })]);
+    } finally {
+      await manager.shutdown();
+      fs.rmSync(templateFile, { force: true });
+      fs.rmSync(scope, { recursive: true, force: true });
+      delete process.env.PI_SUBAGENT_PI_BIN;
+      delete process.env.PI_SUBAGENT_TEST_MODEL_RESPONSES;
+    }
+  });
+
+  test("accepts an exact slash-containing template ID using read-only checks", async () => {
+    process.env.PI_SUBAGENT_PI_BIN = FAKE_RPC_CHILD;
+    const parentSessionId = "exact-slash-route";
+    const scope = path.join(getRunsDir(), parentScopeKey(parentSessionId));
+    const templateFile = path.join(TEST_AGENT_DIR, "pi-codex-subagents", "agents", "slash-route.md");
+    const modelId = "accounts/fireworks/models/glm-5p2";
+    const manager = new AgentManager();
+    fs.writeFileSync(templateFile, `---\nname: slash-route\nmodel: ${modelId}\n---\n`);
+    try {
+      await manager.spawnAgent({
+        ...spawnParams(parentSessionId, "worker", "hold exact route"),
+        agent_type: "slash-route", inheritedProvider: "fireworks", inheritedModelId: "unused-parent-model",
+      });
+      const info = manager.getAgentInfo("worker", parentSessionId);
+      expect(info).toMatchObject({ provider: "fireworks", modelId, model: `fireworks:${modelId}`, status: "running" });
+      const records = fs.readFileSync(info.sessionFile, "utf8").trim().split("\n").map((line) => JSON.parse(line));
+      expect(records.map((entry) => entry.type)).toEqual(["started", "get_state", "get_available_models", "prompt"]);
+    } finally {
+      await manager.shutdown();
+      fs.rmSync(templateFile, { force: true });
+      fs.rmSync(scope, { recursive: true, force: true });
+      delete process.env.PI_SUBAGENT_PI_BIN;
+    }
+  });
+
+  const restartFailures: Array<[string, Record<string, unknown>, string]> = [
+    ["catalog-drift", { availableModels: { models: [{ provider: "openai", id: "gpt-5" }] } }, "test/template-model"],
+    ["selection-drift", { state: { model: { provider: "openai", id: "gpt-5" } } }, "test/template-model"],
+    ["startup-exit", { exitOn: "get_state" }, "code=23"],
+  ];
+  test.each(restartFailures)("revalidates the persisted pair on restart after %s", async (name, responses, reason) => {
+    process.env.PI_SUBAGENT_PI_BIN = FAKE_RPC_CHILD;
+    const parentSessionId = `restart-validation-${name}`;
+    const scope = path.join(getRunsDir(), parentScopeKey(parentSessionId));
+    const templateFile = path.join(TEST_AGENT_DIR, "pi-codex-subagents", "agents", `restart-${name}.md`);
+    const completions: any[] = [];
+    const manager = new AgentManager({ onUnclaimedCompletion: (event) => completions.push(event) });
+    fs.writeFileSync(templateFile, `---\nname: restart-${name}\nmodel: template-model\n---\n`);
+    try {
+      await manager.spawnAgent({ ...spawnParams(parentSessionId, "worker", "first"), agent_type: `restart-${name}` });
+      await waitUntil(() => {
+        const info = manager.getAgentInfo("worker", parentSessionId);
+        return info.status === "completed" && !info.childProcess;
+      });
+      // A template edit must not replace the saved pair at restart.
+      fs.writeFileSync(templateFile, `---\nname: restart-${name}\nprovider: openai\nmodel: gpt-5\n---\n`);
+      process.env.PI_SUBAGENT_TEST_MODEL_RESPONSES = JSON.stringify(responses);
+      await expect(manager.sendMessage(parentSessionId, "worker", "must not run")).rejects.toThrow(reason);
+      const failed = manager.getAgentInfo("worker", parentSessionId);
+      expect(failed).toMatchObject({ provider: "test", modelId: "template-model", model: "test:template-model", status: "failed", messageCount: 1 });
+      expect(failed.error).toContain(reason);
+      expect(failed.finalResponse).toBeUndefined();
+      expect(failed.childProcess).toBeUndefined();
+      const records = fs.readFileSync(failed.sessionFile, "utf8").trim().split("\n").map((line) => JSON.parse(line));
+      const starts = records.filter((entry) => entry.type === "started");
+      expect(starts).toHaveLength(2);
+      for (const start of starts) {
+        expect(start.args[start.args.indexOf("--provider") + 1]).toBe("test");
+        expect(start.args[start.args.indexOf("--model") + 1]).toBe("template-model");
+        expect(pidAlive(start.pid)).toBe(false);
+      }
+      expect(records.filter((entry) => entry.type === "prompt").map((entry) => entry.message)).toEqual(["first"]);
+      expect(records.filter((entry) => entry.type === "get_state")).toHaveLength(2);
+      if (name !== "startup-exit") expect(records.filter((entry) => entry.type === "get_available_models")).toHaveLength(2);
+      expect((await manager.waitAgent(parentSessionId, ["worker"])).event).toMatchObject({ status: "failed", error: failed.error });
+      expect(completions.filter((event) => event.status === "failed")).toHaveLength(1);
+    } finally {
+      await manager.shutdown();
+      fs.rmSync(templateFile, { force: true });
+      fs.rmSync(scope, { recursive: true, force: true });
+      delete process.env.PI_SUBAGENT_PI_BIN;
+      delete process.env.PI_SUBAGENT_TEST_MODEL_RESPONSES;
+    }
+  });
+});
+
+describe("concurrent restarts", () => {
+  test.each([
+    ["hibernated", "invalid"],
+    ["hibernated", "valid"],
+    ["terminating", "invalid"],
+    ["owned-cleanup", "invalid"],
+  ] as const)("rejects a pending restart after %s (%s catalog)", async (phase, catalog) => {
+    const validCatalog = catalog === "valid";
+    process.env.PI_SUBAGENT_PI_BIN = FAKE_RPC_CHILD;
+    const parentSessionId = `concurrent-restart-${phase}-${validCatalog}`;
+    const scope = path.join(getRunsDir(), parentScopeKey(parentSessionId));
+    const completions: any[] = [];
+    const manager = new AgentManager({ onUnclaimedCompletion: (event) => completions.push(event) });
+    let releaseCleanup = () => {};
+    let interruption: Promise<unknown> | undefined;
+    try {
+      const initialTask = phase === "terminating" ? "hold first" : "first";
+      await manager.spawnAgent(spawnParams(parentSessionId, "worker", initialTask));
+      const initial = manager.getAgentInfo("worker", parentSessionId);
+      let cleanupCalls = 0;
+      if (phase === "terminating") {
+        interruption = manager.interruptAgent(parentSessionId, "worker");
+        await Promise.resolve();
+        expect(manager["live"].get(initial.id)?.expectedExit).toBe(true);
+      } else {
+        await waitUntil(() => {
+          const info = manager.getAgentInfo("worker", parentSessionId);
+          return info.status === "completed" && !info.childProcess;
+        });
+        if (phase === "owned-cleanup") {
+          // Force both callers across an async cleanup gap for stale persisted ownership.
+          const info = manager.getAgentInfo("worker", parentSessionId);
+          info.childProcess = initial.childProcess;
+          fs.writeFileSync(info.infoFile, JSON.stringify(info));
+          const cleanupGate = new Promise<void>((resolve) => { releaseCleanup = resolve; });
+          const terminate = manager["terminateOwnedChild"].bind(manager);
+          manager["terminateOwnedChild"] = async (owned) => {
+            cleanupCalls++;
+            await cleanupGate;
+            await terminate(owned);
+          };
+        }
+      }
+      if (!validCatalog) process.env.PI_SUBAGENT_TEST_MODEL_RESPONSES = JSON.stringify({ availableModels: { models: [] } });
+      const pending = Promise.allSettled([
+        manager.sendMessage(parentSessionId, "worker", "hold first restart"),
+        manager.sendMessage(parentSessionId, "worker", "hold second restart"),
+      ]);
+      await Promise.resolve();
+      releaseCleanup();
+      const attempts = await pending;
+      await interruption;
+      expect(attempts[1]).toMatchObject({
+        status: "rejected", reason: expect.objectContaining({ message: expect.stringContaining("still starting") }),
+      });
+      if (validCatalog) expect(attempts[0]).toEqual({ status: "fulfilled", value: { delivery: "prompt" } });
+      else expect(attempts[0]).toMatchObject({
+        status: "rejected", reason: expect.objectContaining({ message: expect.stringContaining("not registered") }),
+      });
+      if (phase === "owned-cleanup") expect(cleanupCalls).toBe(2);
+      const info = manager.getAgentInfo("worker", parentSessionId);
+      expect(info).toMatchObject({ status: validCatalog ? "running" : "failed", messageCount: validCatalog ? 2 : 1 });
+      expect(info.finalResponse).toBeUndefined();
+      if (!validCatalog) expect(info.error).toContain("not registered");
+      expect(completions.filter((event) => event.status === "failed")).toHaveLength(validCatalog ? 0 : 1);
+      const records = fs.readFileSync(info.sessionFile, "utf8").trim().split("\n").map((line) => JSON.parse(line));
+      const starts = records.filter((entry) => entry.type === "started");
+      expect(starts).toHaveLength(2);
+      if (!validCatalog) {
+        expect(info.childProcess).toBeUndefined();
+        for (const start of starts) expect(pidAlive(start.pid)).toBe(false);
+      }
+      expect(records.filter((entry) => entry.type === "prompt").map((entry) => entry.message))
+        .toEqual(validCatalog ? [initialTask, "hold first restart"] : [initialTask]);
+      const restart = records.slice(records.findLastIndex((entry) => entry.type === "started"));
+      expect(restart.slice(0, 3).map((entry) => entry.type)).toEqual(["started", "get_state", "get_available_models"]);
+      await manager.shutdown();
+      expect(manager.getAgentInfo("worker", parentSessionId).childProcess).toBeUndefined();
+      for (const start of starts) expect(pidAlive(start.pid)).toBe(false);
+    } finally {
+      releaseCleanup();
+      await interruption;
+      await manager.shutdown();
+      fs.rmSync(scope, { recursive: true, force: true });
+      delete process.env.PI_SUBAGENT_PI_BIN;
+      delete process.env.PI_SUBAGENT_TEST_MODEL_RESPONSES;
+    }
+  });
+});
+
+describe("startup retry failure recording", () => {
+  test.each(["failed", "interrupted"] as const)("records each new startup failure after a prior %s run", async (priorStatus) => {
+    process.env.PI_SUBAGENT_PI_BIN = FAKE_RPC_CHILD;
+    const parentSessionId = `startup-retry-${priorStatus}`;
+    const scope = path.join(getRunsDir(), parentScopeKey(parentSessionId));
+    const completions: any[] = [];
+    const manager = new AgentManager({ onUnclaimedCompletion: (event) => completions.push(event) });
+    try {
+      if (priorStatus === "failed") {
+        process.env.PI_SUBAGENT_TEST_MODEL_RESPONSES = JSON.stringify({ availableModels: { models: [] } });
+        await expect(manager.spawnAgent(spawnParams(parentSessionId, "worker", "must not run"))).rejects.toThrow("not registered");
+      } else {
+        await manager.spawnAgent(spawnParams(parentSessionId, "worker", "hold old task"));
+        await manager.interruptAgent(parentSessionId, "worker");
+      }
+      let previous = manager.getAgentInfo("worker", parentSessionId);
+      expect(previous.status).toBe(priorStatus);
+      let previousCompletionId = completions.at(-1)?.id;
+      process.env.PI_SUBAGENT_TEST_MODEL_RESPONSES = JSON.stringify({ exitOn: "get_state" });
+      for (let attempt = 0; attempt < 2; attempt++) {
+        const completionCount = completions.length;
+        let returnedError: Error | undefined;
+        try {
+          await manager.sendMessage(parentSessionId, "worker", "must not run");
+        } catch (error) {
+          returnedError = error as Error;
+        }
+        expect(returnedError).toBeInstanceOf(Error);
+        const message = returnedError!.message;
+        expect(message).toContain("code=23");
+        if (attempt === 0 && priorStatus === "failed") expect(message).not.toBe(previous.error);
+        if (attempt === 1) expect(message).toBe(previous.error); // Identical causes are still distinct attempts.
+        const failed = manager.getAgentInfo("worker", parentSessionId);
+        expect(failed).toMatchObject({ status: "failed", error: message, messageCount: previous.messageCount });
+        expect(failed.finalResponse).toBeUndefined();
+        expect(failed.childProcess).toBeUndefined();
+        expect(completions.slice(completionCount)).toEqual([expect.objectContaining({ status: "failed", error: message })]);
+        const completion = completions[completionCount];
+        expect(completion.id).not.toBe(previousCompletionId);
+        expect((await manager.waitAgent(parentSessionId, ["worker"])).event).toMatchObject({ id: completion.id, status: "failed", error: message });
+        const records = fs.readFileSync(failed.sessionFile, "utf8").trim().split("\n").map((line) => JSON.parse(line));
+        const starts = records.filter((entry) => entry.type === "started");
+        expect(starts).toHaveLength(attempt + 2);
+        for (const start of starts) expect(pidAlive(start.pid)).toBe(false);
+        expect(records.filter((entry) => entry.type === "prompt").map((entry) => entry.message))
+          .toEqual(priorStatus === "interrupted" ? ["hold old task"] : []);
+        previous = failed;
+        previousCompletionId = completion.id;
+      }
+    } finally {
+      await manager.shutdown();
+      fs.rmSync(scope, { recursive: true, force: true });
+      delete process.env.PI_SUBAGENT_PI_BIN;
+      delete process.env.PI_SUBAGENT_TEST_MODEL_RESPONSES;
+    }
+  });
+});
+
 describe("child process lifecycle", () => {
+  test.each(["completed", "failed", "interrupted"] as const)("preserves the previous %s result when shutdown cancels a pending restart", async (status) => {
+    process.env.PI_SUBAGENT_PI_BIN = FAKE_RPC_CHILD;
+    const parentSessionId = `shutdown-pending-restart-${status}`;
+    const scope = path.join(getRunsDir(), parentScopeKey(parentSessionId));
+    const completions: any[] = [];
+    const manager = new AgentManager({ onUnclaimedCompletion: (event) => completions.push(event) });
+    const firstMessage = status === "failed" ? "fail first" : status === "interrupted" ? "hold first" : "first";
+    try {
+      await manager.spawnAgent(spawnParams(parentSessionId, "worker", firstMessage));
+      if (status === "interrupted") await manager.interruptAgent(parentSessionId, "worker");
+      await waitUntil(() => {
+        const info = manager.getAgentInfo("worker", parentSessionId);
+        return info.status === status && !info.childProcess;
+      });
+      const previous = manager.getAgentInfo("worker", parentSessionId);
+      const previousCompletionIds = completions.map((event) => event.id);
+      process.env.PI_SUBAGENT_TEST_MODEL_RESPONSES = JSON.stringify({ holdOn: "get_state" });
+      const pending = manager.sendMessage(parentSessionId, "worker", "must not run").then(
+        () => undefined, (error: unknown) => error,
+      );
+      await waitUntil(() => Boolean(manager["live"].get(previous.id)?.pending.size));
+      await manager.shutdown();
+      expect(await pending).toBeInstanceOf(Error);
+      const after = manager.getAgentInfo("worker", parentSessionId);
+      expect(after).toMatchObject({ status, messageCount: previous.messageCount });
+      expect(after.completedAt).toBe(previous.completedAt);
+      expect(after.finalResponse).toBe(previous.finalResponse);
+      expect(after.error).toBe(previous.error);
+      expect(after.childProcess).toBeUndefined();
+      expect(manager["live"].has(previous.id)).toBe(false);
+      expect(completions.map((event) => event.id)).toEqual(previousCompletionIds);
+      const records = fs.readFileSync(after.sessionFile, "utf8").trim().split("\n").map((line) => JSON.parse(line));
+      expect(records.filter((entry) => entry.type === "prompt").map((entry) => entry.message)).toEqual([firstMessage]);
+      const starts = records.filter((entry) => entry.type === "started");
+      expect(starts).toHaveLength(2);
+      for (const start of starts) expect(pidAlive(start.pid)).toBe(false);
+    } finally {
+      await manager.shutdown();
+      fs.rmSync(scope, { recursive: true, force: true });
+      delete process.env.PI_SUBAGENT_PI_BIN;
+      delete process.env.PI_SUBAGENT_TEST_MODEL_RESPONSES;
+    }
+  });
+
   test("hibernates after settle and lazily restarts the persisted session", async () => {
     fs.rmSync(path.join(TEST_AGENT_DIR, "pi-codex-subagents", "config.json"), { force: true });
     fs.rmSync(path.join(TEST_AGENT_DIR, "pi-codex-subagents", "SYSTEM.md"), { force: true });
@@ -896,6 +1282,8 @@ describe("extension completion delivery and TUI", () => {
     const scope = path.join(getRunsDir(), parentScopeKey(parentSessionId));
     fs.rmSync(scope, { recursive: true, force: true });
     const configFile = path.join(TEST_AGENT_DIR, "pi-codex-subagents", "config.json");
+    const modelOnlyTemplateFile = path.join(TEST_AGENT_DIR, "pi-codex-subagents", "agents", "current-parent.md");
+    fs.writeFileSync(modelOnlyTemplateFile, "---\nname: current-parent\nmodel: template-model\n---\n");
     // A thinking suffix on an allowlist entry is tolerated and stripped from the offered pair.
     fs.writeFileSync(configFile, JSON.stringify({ models: ["test/fake:high", "typo/nope"], modelsFromEnabledModels: true }));
     const { default: subagentExtension } = await import("./index.js");
@@ -1036,10 +1424,32 @@ describe("extension completion delivery and TUI", () => {
       expect(spawnArgs().model).toBeUndefined();
       expect(spawnArgs().thinking).toBeUndefined();
       expect(tools.get("spawn_agent").description).not.toContain("`model` takes one of the values");
+      expect(tools.get("spawn_agent").description).toContain("current parent provider at spawn");
+
+      // Template models may exist only in the isolated child registry, not the parent registry or allowlist.
+      await tools.get("spawn_agent").execute("spawn-model-only-1", {
+        task_name: "model-only/current-provider", message: "hold model-only", agent_type: "current-parent",
+      }, undefined, undefined, ctx);
+      expect(getAgent("model-only/current-provider", parentSessionId)).toMatchObject({
+        provider: "test", modelId: "template-model", thinking: "high",
+      });
+      // No session restart: each spawn must read the current parent provider, not a cached route.
+      ctx.model = { provider: "template-provider", id: "parent-model" };
+      availableModels.push(ctx.model);
+      await tools.get("spawn_agent").execute("spawn-model-only-2", {
+        task_name: "model-only/changed-provider", message: "hold changed provider", agent_type: "current-parent",
+      }, undefined, undefined, ctx);
+      expect(getAgent("model-only/changed-provider", parentSessionId)).toMatchObject({
+        provider: "template-provider", modelId: "template-model", thinking: "high",
+      });
+      expect(getAgent("model-only/current-provider", parentSessionId)).toMatchObject({ provider: "test", modelId: "template-model" });
+      expect(spawnArgs().model).toBeUndefined();
+      expect(spawnArgs().thinking).toBeUndefined();
     } finally {
       await emit("session_shutdown", { reason: "quit" });
       fs.rmSync(scope, { recursive: true, force: true });
       fs.rmSync(configFile, { force: true });
+      fs.rmSync(modelOnlyTemplateFile, { force: true });
       delete process.env.PI_SUBAGENT_PI_BIN;
     }
   });
