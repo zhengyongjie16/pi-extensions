@@ -1,13 +1,24 @@
-import { describe, expect, mock, test } from "bun:test";
+import { afterAll, afterEach, beforeEach, describe, expect, mock, test } from "bun:test";
+import { randomUUID } from "node:crypto";
+import { once } from "node:events";
+import { stripVTControlCharacters } from "node:util";
+import type { AgentInfo } from "./core.js";
 import * as fs from "node:fs";
 import * as net from "node:net";
 import * as os from "node:os";
 import * as path from "node:path";
 import { visibleWidth } from "@earendil-works/pi-tui";
 
-const TEST_AGENT_DIR = "/tmp/pi-codex-subagents-tests";
+// macOS os.tmpdir() can be too long for a Unix socket address; keep the POSIX root short.
+const TEST_AGENT_DIR = fs.mkdtempSync(path.join(process.platform === "win32" ? os.tmpdir() : "/tmp", "ps-"));
 const FAKE_RPC_CHILD = path.join(import.meta.dir, "test", "fake-rpc-child.js");
-process.env.PI_SUBAGENT_TEMP_DIR = path.join(TEST_AGENT_DIR, "temp");
+const previousTempDir = process.env.PI_SUBAGENT_TEMP_DIR;
+process.env.PI_SUBAGENT_TEMP_DIR = TEST_AGENT_DIR;
+afterAll(() => {
+  if (previousTempDir === undefined) delete process.env.PI_SUBAGENT_TEMP_DIR;
+  else process.env.PI_SUBAGENT_TEMP_DIR = previousTempDir;
+  fs.rmSync(TEST_AGENT_DIR, { recursive: true, force: true });
+});
 
 const codingAgent = await import("@earendil-works/pi-coding-agent");
 mock.module("@earendil-works/pi-coding-agent", () => ({
@@ -18,6 +29,7 @@ mock.module("@earendil-works/pi-coding-agent", () => ({
 
 const {
   AgentManager,
+  EventBroadcaster,
   RpcAssistantStreamState,
   RpcJsonlDecoder,
   consumeFirstMatchingMailboxEvent,
@@ -30,7 +42,7 @@ const {
   parseAgentDefinitionText,
   taskStorageKey,
 } = await import("./core.js");
-const { formatAgentSpecLines } = await import("./peek.js");
+const { formatAgentSpecLines, SubagentPeekOverlay } = await import("./peek.js");
 
 
 test("formats the resolved subagent model and thinking for the detail overlay", () => {
@@ -1052,5 +1064,402 @@ describe("completion mailbox", () => {
     expect(events.map((event) => event.id)).toEqual(["2", "3"]);
     expect(consumeFirstMatchingMailboxEvent(events, "parent", new Set(["/two"]))?.agentName).toBe("/two");
     expect(events.map((event) => event.id)).toEqual(["3"]);
+  });
+});
+
+describe("observer broadcast", () => {
+  let broadcaster: InstanceType<typeof EventBroadcaster>;
+  let agentId: string;
+  let events: any[];
+  let sockets: net.Socket[];
+  let overlays: InstanceType<typeof SubagentPeekOverlay>[];
+
+  beforeEach(async () => {
+    agentId = randomUUID();
+    events = [];
+    sockets = [];
+    overlays = [];
+    broadcaster = new EventBroadcaster(agentId);
+    broadcaster.start();
+    await once(broadcaster["server"]!, "listening");
+    const socket = net.connect(getSocketPath(agentId));
+    sockets.push(socket);
+    const decoder = new RpcJsonlDecoder();
+    socket.on("data", (chunk) => {
+      for (const line of decoder.push(chunk)) events.push(JSON.parse(line));
+    });
+    let error: Error | undefined;
+    socket.on("error", (value) => { error = value; });
+    await waitUntil(() => {
+      if (error) throw error;
+      return events[0]?.type === "sync";
+    });
+    events.length = 0;
+  });
+
+  afterEach(async () => {
+    const server = broadcaster["server"];
+    const closed = server ? once(server, "close") : Promise.resolve();
+    for (const overlay of overlays) overlay.dispose();
+    for (const socket of sockets) socket.destroy();
+    broadcaster.stop();
+    await closed;
+  });
+
+  const start = (id: string, toolName = "codemode", args: any = { code: "script" }) => ({
+    type: "tool_execution_start", toolCallId: id, toolName, args,
+  });
+  const update = (id: string, partialResult: any) => ({
+    type: "tool_execution_update", toolCallId: id, toolName: "codemode", partialResult,
+  });
+  const end = (id: string, result: any, isError = false) => ({
+    type: "tool_execution_end", toolCallId: id, toolName: "codemode", result, isError,
+  });
+  const textResult = (text: string) => ({ content: [{ type: "text", text }], details: {} });
+  const messageEnd = (id: string) => ({
+    type: "message_end", message: { role: "toolResult", toolCallId: id },
+  });
+  const emit = (...values: any[]) => {
+    for (const value of values) broadcaster.broadcast(value);
+  };
+  const snapshot = async () => (await readSocketEvents(getSocketPath(agentId), 1))[0];
+  const flush = async () => {
+    const token = randomUUID();
+    emit({ type: "test_barrier", token });
+    await waitUntil(() => events.some((event) => event.type === "test_barrier" && event.token === token));
+    return events.filter((event) => event.type !== "test_barrier");
+  };
+  const nested = (event: any, parentToolCallId: string) => ({ ...event, parentToolCallId });
+
+  test("filters parallel nested notifications before state changes and preserves parent progress/results", async () => {
+    const parent = start("parent");
+    const partialResult = {
+      ...textResult("script is running"),
+      details: { calls: [{ id: "parent/1", name: "read", status: "running" }] },
+    };
+    const result = {
+      ...textResult("caught child error; script succeeded"),
+      details: { calls: [{ id: "parent/1", name: "read", status: "error", error: "missing file" }] },
+    };
+    emit(parent,
+      nested(start("parent/1", "read"), "parent"),
+      nested(start("parent/2", "powershell"), "parent"),
+      nested(update("parent/1", textResult("child-only output")), "parent"),
+      update("parent", partialResult));
+    expect(await snapshot()).toMatchObject({
+      status: "tool", toolName: "codemode",
+      activeTools: [{ toolCallId: "parent", toolName: "codemode", args: parent.args, partialResult }],
+    });
+
+    emit(nested(end("parent/1", textResult("missing file"), true), "parent"),
+      nested(end("parent/2", textResult("child-only output")), "parent"),
+      end("parent", result));
+    expect(await flush()).toEqual([parent, update("parent", partialResult), end("parent", result)]);
+    expect((await snapshot()).activeTools).toEqual([{
+      toolCallId: "parent", toolName: "codemode", args: parent.args, partialResult, result, isError: false,
+    }]);
+  });
+
+  test("ignores orphaned and multi-level nested events even without a cached parent", async () => {
+    const before = await snapshot();
+    for (const parent of ["missing", "missing/child"]) {
+      const id = `${parent}/child`;
+      emit(nested(start(id, "codemode"), parent),
+        nested(update(id, textResult("nested progress")), parent),
+        nested(end(id, textResult("nested failure"), true), parent));
+    }
+    expect(await flush()).toEqual([]);
+    expect(await snapshot()).toEqual(before);
+  });
+
+  test("keeps genuine top-level read, powershell and MCP calls, including IDs with slashes", async () => {
+    const expected: any[] = [];
+    for (const [id, name] of [["top/read", "read"], ["top/shell", "powershell"], ["top/mcp", "mcp__docs"]]) {
+      const values = [
+        start(id, name, { input: name }),
+        { ...update(id, textResult("progress")), toolName: name },
+        { ...end(id, textResult("output")), toolName: name },
+      ];
+      emit(...values);
+      expected.push(...values);
+    }
+    expect(await flush()).toEqual(expected);
+    expect((await snapshot()).activeTools.map((tool: any) => [tool.toolCallId, tool.toolName]))
+      .toEqual([["top/read", "read"], ["top/shell", "powershell"], ["top/mcp", "mcp__docs"]]);
+  });
+
+  test.each([false, true])("retains a finished parent's result until its toolResult message (isError=%s)", async (isError) => {
+    const result = { ...textResult("final script output"), details: { calls: [], elapsed: 42 } };
+    const inputs = [start("parent"), end("parent", result, isError)] as const;
+    const original = JSON.stringify(inputs);
+    emit(...inputs);
+    expect((await snapshot()).activeTools).toEqual([{
+      toolCallId: "parent", toolName: "codemode", args: inputs[0].args, result, isError,
+    }]);
+    // message_end is the existing event handoff, not a disk-write acknowledgement.
+    emit(messageEnd("parent"));
+    expect((await snapshot()).activeTools).toEqual([]);
+    expect(await flush()).toEqual([...inputs, messageEnd("parent")]);
+    expect(JSON.stringify(inputs)).toBe(original);
+  });
+
+  test("updates and clears parallel top-level calls independently", async () => {
+    emit(start("a"), start("b"),
+      nested(start("a/1", "read"), "a"),
+      nested(start("a/1/1", "powershell"), "a/1"),
+      update("a", textResult("a progress")), end("a", textResult("a done")));
+    expect((await snapshot()).activeTools.map((tool: any) => tool.toolCallId)).toEqual(["a", "b"]);
+    emit(messageEnd("a"),
+      nested(end("a/1", textResult("late child"), true), "a"),
+      update("b", textResult("b progress")));
+    expect((await snapshot()).activeTools).toEqual([{
+      toolCallId: "b", toolName: "codemode", args: { code: "script" }, partialResult: textResult("b progress"),
+    }]);
+    emit(end("b", textResult("b done")), messageEnd("b"));
+    expect((await snapshot()).activeTools).toEqual([]);
+    expect((await flush()).filter((event) => event.parentToolCallId)).toEqual([]);
+  });
+
+  test("forwards non-execution lifecycle/RPC events even when they carry parent metadata", async () => {
+    const values = [
+      { type: "agent_start" },
+      { type: "response", id: "rpc", success: false, error: "expected" },
+      { type: "message_start", message: { role: "user", content: "task" } },
+      { type: "message_end", message: { role: "toolResult", toolCallId: "unknown" } },
+      { type: "agent_end", messages: [] },
+      { type: "auto_retry_end", success: false, finalError: "retry failed" },
+      { type: "agent_settled" },
+    ].map((event) => ({ ...event, parentToolCallId: "metadata-only" }));
+    emit(...values);
+    expect(await flush()).toEqual(values);
+    expect(await snapshot()).toMatchObject({ status: "done", activeTools: [] });
+  });
+
+  test("does not accumulate completed nested calls over 100 scripts in one unsettled run", async () => {
+    for (let index = 0; index < 100; index++) {
+      const id = `script-${index}`;
+      emit(start(id));
+      for (let child = 1; child <= 2; child++) {
+        emit(nested(start(`${id}/${child}`, child === 1 ? "read" : "powershell"), id),
+          nested(end(`${id}/${child}`, textResult("child output")), id));
+      }
+      emit(update(id, textResult("script progress")), end(id, textResult("script output")), messageEnd(id));
+    }
+    expect((await snapshot()).activeTools).toEqual([]);
+    const live = await flush();
+    for (const type of ["tool_execution_start", "tool_execution_update", "tool_execution_end", "message_end"]) {
+      expect(live.filter((event) => event.type === type)).toHaveLength(100);
+    }
+    expect(live.some((event) => event.parentToolCallId)).toBe(false);
+  });
+
+  test.each(["aborted", "error"])("preserves failure/interruption and settled cleanup (%s)", async (stopReason) => {
+    const values = [
+      start("parent"),
+      end("parent", textResult("Operation failed"), true),
+      { type: "message_end", message: { role: "assistant", content: [], stopReason, errorMessage: "Operation failed" } },
+      { type: "agent_end", messages: [] },
+    ];
+    emit(...values);
+    expect((await snapshot()).activeTools).toHaveLength(1);
+    emit({ type: "agent_settled" },
+      nested(start("late/child", "read"), "finished-parent"),
+      nested(end("late/child", textResult("late nested failure"), true), "finished-parent"));
+    expect(await flush()).toEqual([...values, { type: "agent_settled" }]);
+    const sync = await snapshot();
+    expect(sync).toMatchObject({ status: "done", activeTools: [], partialMessage: null, userMessage: null });
+    expect(sync.toolName).toBeUndefined();
+  });
+
+  test("keeps raw nested RPC activity, completion delivery, response reads and waits in AgentManager", async () => {
+    const completions: any[] = [];
+    const manager = new AgentManager({ onUnclaimedCompletion: (event) => completions.push(event) });
+    const terminate = mock(async () => {});
+    manager["terminateProcess"] = terminate;
+    await manager.ready();
+    const parentSessionId = `observer-${agentId}`;
+    const scope = path.join(getRunsDir(), parentScopeKey(parentSessionId));
+    fs.mkdirSync(scope, { recursive: true });
+    const info: AgentInfo = {
+      id: agentId, taskName: "observer", canonicalName: "/observer", parentSessionId,
+      provider: "test", modelId: "fake", model: "test:fake", cwd: TEST_AGENT_DIR,
+      sessionFile: path.join(scope, `${agentId}.jsonl`),
+      infoFile: path.join(scope, `${agentId}.info.json`),
+      logFile: path.join(scope, `${agentId}.log`),
+      createdAt: Date.now(), updatedAt: Date.now(), messageCount: 0, status: "starting",
+    };
+    const live: any = {
+      info, broadcaster, logger: { info() {} }, pending: new Map(),
+      lastActivityPersistedAt: 0, finalizedRun: false, expectedExit: false,
+    };
+    const receive = (...values: any[]) => {
+      const decoder = new RpcJsonlDecoder();
+      const data = Buffer.from(values.map((event) => JSON.stringify(event) + "\n").join(""));
+      for (const chunk of [data.subarray(0, 7), data.subarray(7)]) {
+        for (const line of decoder.push(chunk)) manager["handleLine"](live, line);
+      }
+    };
+    try {
+      for (const event of [
+        nested(start("parent/1", "read"), "parent"),
+        nested(update("parent/1", textResult("nested progress")), "parent"),
+        nested(end("parent/1", textResult("nested error"), true), "parent"),
+      ]) {
+        live.info.status = "starting";
+        live.lastActivityPersistedAt = 0;
+        receive(event);
+        expect(JSON.parse(fs.readFileSync(info.infoFile, "utf8"))).toMatchObject({
+          status: "running", lastActivity: live.info.lastActivity,
+        });
+      }
+      expect(await flush()).toEqual([]);
+      const resolve = mock(() => {});
+      live.pending.set("rpc", { resolve, reject: mock(), timer: setTimeout(() => {}, 5000) });
+      receive({ type: "response", id: "rpc", success: true, data: { ok: true }, parentToolCallId: "metadata" });
+      expect(resolve).toHaveBeenCalledWith({ ok: true });
+      expect(live.pending.size).toBe(0);
+
+      receive({ type: "message_end", message: { role: "assistant", content: [{ type: "text", text: "final response" }], stopReason: "stop" } },
+        { type: "agent_settled" });
+      expect(completions).toHaveLength(1);
+      expect(completions[0]).toMatchObject({ status: "completed", finalResponse: "final response" });
+      expect(terminate).toHaveBeenCalledTimes(1);
+      expect(manager.readAgentResponse("observer", parentSessionId)).toMatchObject({
+        status: "completed", finalResponse: "final response",
+      });
+      expect((await manager.waitAgent(parentSessionId, ["observer"])).event).toMatchObject({ status: "completed" });
+      expect((await manager.waitAllAgents(parentSessionId, ["observer"])).responses)
+        .toEqual([expect.objectContaining({ status: "completed", finalResponse: "final response" })]);
+      expect((await snapshot()).activeTools).toEqual([]);
+    } finally {
+      for (const pending of live.pending.values()) clearTimeout(pending.timer);
+      await manager.shutdown();
+      fs.rmSync(scope, { recursive: true, force: true });
+    }
+  });
+
+  test("renders live, reconnect and persisted history with the same top-level ownership", async () => {
+    codingAgent.initTheme("dark", false);
+    const sessionDir = fs.mkdtempSync(path.join(TEST_AGENT_DIR, "observer-session-"));
+    const session = codingAgent.SessionManager.create(TEST_AGENT_DIR, sessionDir);
+    session.appendMessage({ role: "user", content: "isolated observer task", timestamp: Date.now() });
+    const info = {
+      id: agentId, taskName: "observer", provider: "test", modelId: "fake", model: "test:fake",
+      cwd: TEST_AGENT_DIR, sessionFile: session.getSessionFile()!,
+    } as AgentInfo;
+    const navigation: Array<"previous" | "next" | undefined> = [];
+    const open = async (expectSync = true) => {
+      const overlay = new SubagentPeekOverlay({
+        terminal: { rows: 80 }, requestRender() {},
+      } as any, { fg: (_color: string, text: string) => text } as any, info, (value) => navigation.push(value));
+      overlays.push(overlay);
+      const socket = overlay["socket"]!;
+      sockets.push(socket);
+      const decoder = new RpcJsonlDecoder();
+      let synced = false;
+      const onData = (chunk: Buffer) => {
+        for (const line of decoder.push(chunk)) {
+          if (JSON.parse(line).type === "sync") synced = true;
+        }
+      };
+      socket.on("data", onData);
+      try {
+        await waitUntil(() => expectSync ? synced : overlay["socket"] === null);
+      } finally {
+        socket.off("data", onData);
+      }
+      return overlay;
+    };
+    const tools = (overlay: InstanceType<typeof SubagentPeekOverlay>) =>
+      overlay["chatContainer"].children.filter((child) => child instanceof codingAgent.ToolExecutionComponent);
+    const render = (overlay: InstanceType<typeof SubagentPeekOverlay>) =>
+      stripVTControlCharacters(overlay.render(120).join("\n"));
+    let overlay = await open();
+    const parent = start("script", "codemode", { code: 'await Promise.all([tools.read({path: "nested.txt"}), tools.powershell({command: "echo nested"})])' });
+    const assistant: any = {
+      role: "assistant", content: [{ type: "toolCall", id: "script", name: "codemode", arguments: parent.args }],
+      api: "test", provider: "test", model: "fake", stopReason: "toolUse", timestamp: Date.now(),
+      usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, totalTokens: 0,
+        cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 } },
+    };
+    emit({ type: "message_start", message: { ...assistant, content: [] } },
+      { type: "message_update", assistantMessageEvent: { type: "toolcall_start", contentIndex: 0, id: "script", toolName: "codemode" } },
+      { type: "message_update", assistantMessageEvent: { type: "toolcall_delta", contentIndex: 0, delta: JSON.stringify(parent.args) } },
+      { type: "message_update", assistantMessageEvent: { type: "toolcall_end", contentIndex: 0, toolCall: assistant.content[0] } },
+      { type: "message_end", message: assistant });
+    session.appendMessage(assistant);
+    emit(parent,
+      nested(start("script/1", "read", { path: "nested.txt" }), "script"),
+      nested(start("script/2", "powershell", { command: "echo nested" }), "script"),
+      update("script", textResult("parent progress")));
+    await waitUntil(() => render(overlay).includes("parent progress"));
+    expect(tools(overlay)).toHaveLength(1);
+    expect(overlay["pendingTools"].has("script/1")).toBe(false);
+    expect(overlay["pendingTools"].has("script/2")).toBe(false);
+
+    overlay.dispose();
+    overlay = await open();
+    expect(tools(overlay)).toHaveLength(1);
+    expect(render(overlay)).toContain("parent progress");
+    const result = textResult("final script output");
+    emit(nested(end("script/1", textResult("nested file")), "script"),
+      nested(end("script/2", textResult("nested shell")), "script"),
+      end("script", result));
+    await waitUntil(() => render(overlay).includes("final script output"));
+    overlay.dispose();
+    overlay = await open();
+    expect(tools(overlay)).toHaveLength(1);
+    expect(render(overlay)).toContain("final script output");
+
+    const toolResult: any = { role: "toolResult", toolCallId: "script", toolName: "codemode", ...result, isError: false, timestamp: Date.now() };
+    emit({ type: "message_end", message: toolResult });
+    // Observe the event/file gap without treating message_end as a disk acknowledgement.
+    await flush();
+    expect(codingAgent.SessionManager.open(info.sessionFile).buildSessionContext().messages
+      .some((message) => message.role === "toolResult")).toBe(false);
+    overlay.dispose();
+    overlay = await open();
+    expect(tools(overlay)).toHaveLength(1);
+    expect(render(overlay)).not.toContain("final script output");
+    session.appendMessage(toolResult);
+    await waitUntil(() => render(overlay).includes("final script output"));
+    const direct = start("direct/read", "read", { path: "real-top-level.txt" });
+    const directAssistant = { ...assistant, content: [{ type: "toolCall", id: direct.toolCallId, name: "read", arguments: direct.args }] };
+    session.appendMessage(directAssistant);
+    emit(direct, { ...end(direct.toolCallId, textResult("top-level file")), toolName: "read" });
+    const directResult: any = { role: "toolResult", toolCallId: direct.toolCallId, toolName: "read",
+      ...textResult("top-level file"), isError: false, timestamp: Date.now() };
+    emit({ type: "message_end", message: directResult });
+    session.appendMessage(directResult);
+    await waitUntil(() => render(overlay).includes("real-top-level.txt"));
+    expect(tools(overlay)).toHaveLength(2);
+    emit({ type: "agent_settled" });
+    await waitUntil(() => overlay["status"] === "done");
+    expect(render(overlay)).toContain("final script output");
+    expect(render(overlay)).toContain("real-top-level.txt");
+    expect(tools(overlay)).toHaveLength(2);
+
+    overlay.dispose();
+    overlay = await open();
+    expect(tools(overlay)).toHaveLength(2);
+    expect(render(overlay)).toContain("final script output");
+    expect(render(overlay)).toContain("real-top-level.txt");
+    for (const key of ["k", "j", "g", "G"]) expect(() => overlay.handleInput(key)).not.toThrow();
+    overlay.handleInput("\x1b[D");
+    overlay = await open();
+    overlay.handleInput("\x1b[C");
+    overlay = await open();
+    overlay.handleInput("q");
+    expect(navigation).toEqual(["previous", "next", undefined]);
+    const closed = once(broadcaster["server"]!, "close");
+    broadcaster.stop();
+    await closed;
+    overlay = await open(false);
+    expect(tools(overlay)).toHaveLength(2);
+    expect(render(overlay)).toContain("final script output");
+    expect(render(overlay)).toContain("real-top-level.txt");
+    expect(codingAgent.SessionManager.open(info.sessionFile).buildSessionContext().messages
+      .filter((message) => message.role === "toolResult").map((message: any) => message.toolCallId))
+      .toEqual(["script", "direct/read"]);
   });
 });

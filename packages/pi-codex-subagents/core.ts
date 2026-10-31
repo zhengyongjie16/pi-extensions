@@ -815,7 +815,7 @@ export class RpcAssistantStreamState {
   }
 }
 
-class EventBroadcaster {
+export class EventBroadcaster {
   private server: net.Server | null = null;
   private connections: net.Socket[] = [];
   private readonly marker: PeekMarker = { pid: process.pid, startedAt: Date.now(), token: randomUUID() };
@@ -862,6 +862,14 @@ class EventBroadcaster {
   }
 
   broadcast(event: any): void {
+    const isToolExecution =
+      event.type === "tool_execution_start" ||
+      event.type === "tool_execution_update" ||
+      event.type === "tool_execution_end";
+
+    // Only top-level calls get observer rows; parents carry nested progress in their own results.
+    if (isToolExecution && event.parentToolCallId) return;
+
     if (event.type === "message_start" && event.message?.role === "user") {
       this.userMessage = event.message;
     } else if (event.type === "message_start" && event.message?.role === "assistant") {
