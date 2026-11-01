@@ -2,7 +2,7 @@
 
 Codex-shaped, session-scoped subagents for [Pi](https://github.com/earendil-works/pi). Spawn isolated child Pi processes, receive their final responses automatically, steer active work, and inspect sessions in a live overlay.
 
-Requires Pi 0.80.4 or newer and Node.js 22.19 or newer.
+Requires Pi 1.4.0 or newer and Node.js 22.19 or newer. Use the same Pi version for parent and child processes.
 
 ## Install
 
@@ -148,6 +148,12 @@ While agents are starting or running, a compact one-line indicator appears above
 
 The overlay uses the child working directory for tool rendering and synchronizes in-progress output when opened midway through a run. Use Left/Right to switch between agents in the current browser scope.
 
+Tools always use Pi’s native **collapsed preview**, independently of the parent’s expanded-tools setting. Shell commands retain their native display; only results use the native preview limits. Codemode keeps its native code preview, nested-call statuses, output preview, timing, and full-output path hints. Other tools without a built-in renderer use Pi’s generic collapsed preview; third-party custom renderers are not inherited across processes. Image display and output padding follow the parent’s settings when the overlay opens.
+
+Tools cannot be expanded here by clicking or pressing Ctrl+O. Native “to expand” hints may still appear, but apply only to Pi’s main transcript. Previews do not truncate stored results, session files, or completion messages. Unknown tools with very long single-line output can still occupy many visual lines, following Pi’s generic logical-line preview.
+
+Historical and sync-final results follow native transcript replay without live-only argument-completion hooks. In particular, old edits are not previewed again against today’s filesystem; live and running-sync calls still use the native execution hooks.
+
 Child RPC processes are terminated after completion, failure, or interruption so settled agents do not keep consuming memory. `send_message` starts a fresh child process with the persisted session and continues from there. Concurrent messages arriving while a child is starting are rejected; retry after startup finishes. On startup, the extension also reconciles and terminates validated owned children left behind by an earlier extension process.
 
 ## Output limits
@@ -157,6 +163,16 @@ Automatic completions, wait tools, and response tools follow Pi's standard 50 KB
 ## Environment
 
 `PI_SUBAGENT_PI_BIN` overrides the Pi executable used for child processes. Normally children use the same Pi installation as the parent.
+
+## Development checks
+
+The root development dependencies and lockfile pin the Pi packages to 1.4.0. After installing them from the repository root, run from this package directory:
+
+```bash
+bun test ./core.test.ts ./peek.test.ts --timeout 60000
+```
+
+Tests include native-renderer comparisons, controlled refresh-resource checks, isolated RPC/socket and session-file recovery, the real extension file loader, and both native TUI drivers with an in-memory terminal. They do not call a model or reload an active extension. Windows builds the RPC test fixture as a temporary Bun executable; the longer timeout accommodates process-identity checks. A real terminal’s visual acceptance and maintenance-window activation remain separate from these automated checks.
 
 ## License
 

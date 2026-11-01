@@ -1,4 +1,4 @@
-import type { Theme, ToolDefinition } from "@earendil-works/pi-coding-agent";
+import type { Theme, ToolDefinition, ToolExecutionOptions, ToolRenderers } from "@earendil-works/pi-coding-agent";
 import {
   AssistantMessageComponent,
   createBashToolDefinition,
@@ -9,6 +9,7 @@ import {
   createPowerShellToolDefinition,
   createReadToolDefinition,
   createWriteToolDefinition,
+  defineTool,
   getMarkdownTheme,
   SessionManager,
   ToolExecutionComponent,
@@ -32,15 +33,15 @@ import {
   type RpcAssistantStreamStatus,
 } from "./core.js";
 
-const TOOL_DEFINITION_FACTORIES = new Map<string, (cwd: string) => ToolDefinition>([
-  ["bash", createBashToolDefinition],
-  ["edit", createEditToolDefinition],
-  ["find", createFindToolDefinition],
-  ["grep", createGrepToolDefinition],
-  ["ls", createLsToolDefinition],
-  ["powershell", createPowerShellToolDefinition],
-  ["read", createReadToolDefinition],
-  ["write", createWriteToolDefinition],
+const TOOL_DEFINITION_FACTORIES = new Map<string, (cwd: string) => ToolDefinition<any, any, any>>([
+  ["bash", (cwd) => defineTool(createBashToolDefinition(cwd))],
+  ["edit", (cwd) => defineTool(createEditToolDefinition(cwd))],
+  ["find", (cwd) => defineTool(createFindToolDefinition(cwd))],
+  ["grep", (cwd) => defineTool(createGrepToolDefinition(cwd))],
+  ["ls", (cwd) => defineTool(createLsToolDefinition(cwd))],
+  ["powershell", (cwd) => defineTool(createPowerShellToolDefinition(cwd))],
+  ["read", (cwd) => defineTool(createReadToolDefinition(cwd))],
+  ["write", (cwd) => defineTool(createWriteToolDefinition(cwd))],
 ]);
 
 const OSC133_PROMPT_MARKER_RE = /\x1b\]133;[ABC]\x07/g;
@@ -62,6 +63,7 @@ export class SubagentPeekOverlay {
   private readonly modelName: string;
   private sessionManager: SessionManager | null = null;
   private lastFileSize = 0;
+  private historyDirty = false; // A loaded snapshot may still await replay after live execution.
   private readonly chatContainer = new Container();
   private scrollOffset = 0;
   private followMode = true;
@@ -71,18 +73,33 @@ export class SubagentPeekOverlay {
   private readonly assistantStream = new RpcAssistantStreamState();
   private streamingComponent: AssistantMessageComponent | null = null;
   private streamingMessage: AssistantMessage | null = null;
-  private readonly pendingTools = new Map<string, ToolExecutionComponent>();
+  // An unmatched historical call is pending, but is not evidence of live execution.
+  private readonly pendingTools = new Map<string, { component: ToolExecutionComponent; executing: boolean }>();
   private pollInterval: ReturnType<typeof setInterval> | null = null;
   private lastConnectAttemptAt = 0;
   private cachedLines: string[] | null = null;
   private cachedWidth: number | null = null;
+  private disposed = false;
+  private readonly toolRenderUi: TUI;
 
   constructor(
     private readonly tui: TUI,
     private readonly theme: Theme,
     private readonly info: AgentInfo,
     private readonly done: (navigation?: "previous" | "next") => void,
+    private readonly nativeCodemodeRenderers: ToolRenderers,
+    private readonly toolExecutionOptions: ToolExecutionOptions = {},
   ) {
+    // Define an own property: assigning through Pi’s TUI proxy prototype would mutate the shared TUI.
+    this.toolRenderUi = Object.create(tui, {
+      requestRender: {
+        value: () => {
+          if (this.disposed) return;
+          this.invalidateCache();
+          this.tui.requestRender();
+        },
+      },
+    });
     this.sessionFile = info.sessionFile;
     this.cwd = info.cwd;
     this.modelName = info.modelId || info.model;
@@ -102,10 +119,22 @@ export class SubagentPeekOverlay {
     }
   }
 
+  private finishToolComponents(): void {
+    for (const child of this.chatContainer.children) {
+      if (child instanceof ToolExecutionComponent) {
+        // UI-only finalization releases native refresh resources on discarded rows.
+        child.updateResult({ content: [], isError: false }, false);
+      }
+    }
+  }
+
   private rebuildChat(): void {
+    if (this.disposed) return;
+    this.finishToolComponents();
+    this.cleanupStreaming();
     this.invalidateCache();
     this.chatContainer.clear();
-    this.pendingTools.clear();
+    this.historyDirty = false;
     if (!this.sessionManager) return;
     const context = this.sessionManager.buildSessionContext();
     for (const message of context.messages) {
@@ -119,6 +148,7 @@ export class SubagentPeekOverlay {
         for (const content of message.content) {
           if (content.type !== "toolCall") continue;
           const component = this.createToolComponent(content.name, content.id, content.arguments);
+          // Replay like the native transcript: args-complete is a live hook (edit previews read today’s files).
           this.chatContainer.addChild(component);
           if (message.stopReason === "aborted" || message.stopReason === "error") {
             component.updateResult({
@@ -126,13 +156,13 @@ export class SubagentPeekOverlay {
               isError: true,
             });
           } else {
-            this.pendingTools.set(content.id, component);
+            this.pendingTools.set(content.id, { component, executing: false });
           }
         }
         continue;
       }
       if (message.role === "toolResult") {
-        const component = this.pendingTools.get(message.toolCallId);
+        const component = this.pendingTools.get(message.toolCallId)?.component;
         if (component) {
           component.updateResult(message);
           this.pendingTools.delete(message.toolCallId);
@@ -142,8 +172,14 @@ export class SubagentPeekOverlay {
   }
 
   private createToolComponent(name: string, id: string, args: any): ToolExecutionComponent {
-    const definition = TOOL_DEFINITION_FACTORIES.get(name)?.(this.cwd);
-    return new ToolExecutionComponent(name, id, args, {}, definition, this.tui, this.cwd);
+    const definition = (name === "codemode"
+      ? this.nativeCodemodeRenderers
+      : TOOL_DEFINITION_FACTORIES.get(name)?.(this.cwd)) ?? {};
+    const component = new ToolExecutionComponent(
+      name, id, args, this.toolExecutionOptions, definition, this.toolRenderUi, this.cwd,
+    );
+    component.setExpanded(false);
+    return component;
   }
 
   private getUserText(message: any): string {
@@ -153,16 +189,19 @@ export class SubagentPeekOverlay {
   }
 
   private connectSocket(): void {
+    if (this.disposed) return;
     this.lastConnectAttemptAt = Date.now();
     try {
       const socket = net.connect(getSocketPath(this.info.id));
       this.socket = socket;
       this.socketBuffer = "";
       socket.on("error", () => {
-        if (this.socket === socket) this.socket = null;
+        if (this.disposed || this.socket !== socket) return;
+        socket.destroy();
       });
       socket.on("close", () => {
-        if (this.socket === socket) this.socket = null;
+        if (this.disposed || this.socket !== socket) return;
+        this.socket = null;
         this.status = "done";
         this.cleanupStreaming();
         this.loadSession();
@@ -170,6 +209,7 @@ export class SubagentPeekOverlay {
         this.tui.requestRender();
       });
       socket.on("data", (data) => {
+        if (this.disposed || this.socket !== socket) return;
         this.socketBuffer += data.toString();
         const lines = this.socketBuffer.split("\n");
         this.socketBuffer = lines.pop() ?? "";
@@ -184,6 +224,7 @@ export class SubagentPeekOverlay {
   }
 
   private handleEvent(event: any): void {
+    if (this.disposed) return;
     if (event.type === "sync") {
       this.loadSession();
       this.rebuildChat();
@@ -204,17 +245,23 @@ export class SubagentPeekOverlay {
         this.syncToolComponentsFromMessage();
       }
       for (const activeTool of event.activeTools ?? []) {
-        let component = this.pendingTools.get(activeTool.toolCallId);
-        if (!component) {
-          component = this.createToolComponent(activeTool.toolName, activeTool.toolCallId, activeTool.args);
+        let pending = this.pendingTools.get(activeTool.toolCallId);
+        if (!pending) {
+          const component = this.createToolComponent(activeTool.toolName, activeTool.toolCallId, activeTool.args);
           this.chatContainer.addChild(component);
-          this.pendingTools.set(activeTool.toolCallId, component);
+          pending = { component, executing: false };
+          this.pendingTools.set(activeTool.toolCallId, pending);
         }
+        const { component } = pending;
+        component.updateArgs(activeTool.args);
         if (activeTool.result) {
-          component.updateResult({ ...activeTool.result, isError: activeTool.isError ?? false });
+          component.updateResult({ ...activeTool.result, isError: activeTool.isError ?? false }, false);
           this.pendingTools.delete(activeTool.toolCallId);
-        } else if (activeTool.partialResult) {
-          component.updateResult({ ...activeTool.partialResult, isError: false }, true);
+        } else {
+          pending.executing = true;
+          component.setArgsComplete();
+          component.markExecutionStarted();
+          if (activeTool.partialResult) component.updateResult({ ...activeTool.partialResult, isError: false }, true);
         }
       }
     } else if (event.type === "message_start") {
@@ -238,8 +285,11 @@ export class SubagentPeekOverlay {
         : undefined;
       this.assistantStream.update(delta, event.message);
       if (previous?.type === "toolCall" && previous.id !== delta.toolCall?.id) {
-        const component = this.pendingTools.get(previous.id);
-        if (component) this.chatContainer.removeChild(component);
+        const component = this.pendingTools.get(previous.id)?.component;
+        if (component) {
+          component.updateResult({ content: [], isError: false }, false);
+          this.chatContainer.removeChild(component);
+        }
         this.pendingTools.delete(previous.id);
       }
       this.streamingMessage = this.assistantStream.message;
@@ -253,12 +303,12 @@ export class SubagentPeekOverlay {
         this.streamingComponent.updateContent(this.streamingMessage!);
         if (event.message.stopReason === "aborted" || event.message.stopReason === "error") {
           const errorMessage = event.message.errorMessage || "Error";
-          for (const component of this.pendingTools.values()) {
+          for (const { component } of this.pendingTools.values()) {
             component.updateResult({ content: [{ type: "text", text: errorMessage }], isError: true });
           }
           this.pendingTools.clear();
         } else {
-          for (const component of this.pendingTools.values()) component.setArgsComplete();
+          for (const { component } of this.pendingTools.values()) component.setArgsComplete();
         }
         this.streamingComponent = null;
         this.streamingMessage = null;
@@ -266,18 +316,37 @@ export class SubagentPeekOverlay {
       }
     } else if (event.type === "tool_execution_start") {
       this.status = "tool";
-      if (event.toolCallId && !this.pendingTools.has(event.toolCallId)) {
-        const component = this.createToolComponent(event.toolName, event.toolCallId, event.args);
-        this.chatContainer.addChild(component);
-        this.pendingTools.set(event.toolCallId, component);
+      if (event.toolCallId) {
+        let pending = this.pendingTools.get(event.toolCallId);
+        if (!pending) {
+          const component = this.createToolComponent(event.toolName, event.toolCallId, event.args);
+          this.chatContainer.addChild(component);
+          pending = { component, executing: true };
+          this.pendingTools.set(event.toolCallId, pending);
+        }
+        pending.executing = true;
+        const { component } = pending;
+        component.updateArgs(event.args);
+        component.setArgsComplete();
+        component.markExecutionStarted();
       }
     } else if (event.type === "tool_execution_update" && event.toolCallId) {
-      const component = this.pendingTools.get(event.toolCallId);
-      if (component && event.partialResult) component.updateResult({ ...event.partialResult, isError: false }, true);
+      const pending = this.pendingTools.get(event.toolCallId);
+      if (pending && event.partialResult) {
+        pending.executing = true;
+        const { component } = pending;
+        component.setArgsComplete();
+        component.markExecutionStarted();
+        component.updateResult({ ...event.partialResult, isError: false }, true);
+      }
     } else if (event.type === "tool_execution_end" && event.toolCallId) {
-      const component = this.pendingTools.get(event.toolCallId);
+      const component = this.pendingTools.get(event.toolCallId)?.component;
       if (component) {
-        component.updateResult({ ...event.result, isError: event.isError ?? false });
+        component.updateResult({
+          ...event.result,
+          isError: event.isError ?? false,
+          durationMs: event.durationMs ?? event.result?.durationMs,
+        }, false);
         this.pendingTools.delete(event.toolCallId);
       }
     } else if (event.type === "agent_settled") {
@@ -297,11 +366,11 @@ export class SubagentPeekOverlay {
       if (content.type !== "toolCall") continue;
       const existing = this.pendingTools.get(content.id);
       if (existing) {
-        existing.updateArgs(content.arguments);
+        existing.component.updateArgs(content.arguments);
       } else {
         const component = this.createToolComponent(content.name, content.id, content.arguments);
         this.chatContainer.addChild(component);
-        this.pendingTools.set(content.id, component);
+        this.pendingTools.set(content.id, { component, executing: false });
       }
     }
   }
@@ -333,12 +402,19 @@ export class SubagentPeekOverlay {
   }
 
   private poll(): void {
+    if (this.disposed) return;
     if (!this.socket && isPeekActive(this.info.id) && Date.now() - this.lastConnectAttemptAt >= 2000) this.connectSocket();
     try {
       const size = fs.statSync(this.sessionFile).size;
-      if (size === this.lastFileSize) return;
-      this.loadSession();
-      if (!this.streamingComponent) this.rebuildChat();
+      if (size !== this.lastFileSize) {
+        this.loadSession();
+        this.historyDirty = true;
+      }
+      if (!this.historyDirty) return;
+      const hasLiveUpdates = this.socket && !this.socket.connecting && !this.socket.destroyed &&
+        (this.streamingComponent || [...this.pendingTools.values()].some((tool) => tool.executing));
+      if (hasLiveUpdates) return;
+      this.rebuildChat();
       this.invalidateCache();
       if (this.followMode) this.scrollOffset = Number.MAX_SAFE_INTEGER;
       this.tui.requestRender();
@@ -346,6 +422,7 @@ export class SubagentPeekOverlay {
   }
 
   handleInput(data: string): void {
+    if (this.disposed) return;
     if (matchesKey(data, "escape") || matchesKey(data, "ctrl+c") || data === "q") {
       this.dispose();
       this.done();
@@ -386,22 +463,26 @@ export class SubagentPeekOverlay {
   }
 
   invalidate(): void {
+    if (this.disposed) return;
     this.chatContainer.invalidate();
     this.invalidateCache();
   }
 
   render(width: number): string[] {
+    if (this.disposed) return [];
     const innerWidth = Math.max(20, width - 2);
     const title = ` ${this.info.taskName} `;
     const modelTag = this.modelName ? `[${truncateToWidth(this.modelName, 18)}] ` : "";
     const statusIcon = { thinking: "◐", streaming: "●", calling: "◒", tool: "◑", done: "✓" }[this.status];
     const statusColor = { thinking: "warning", streaming: "success", calling: "accent", tool: "accent", done: "success" }[this.status];
     const statusText = ` ${statusIcon} ${this.status} `;
-    const headerWidth = visibleWidth(title) + visibleWidth(modelTag) + visibleWidth(statusText);
+    const heading = truncateToWidth(
+      this.theme.fg("accent", title) + this.theme.fg("dim", modelTag),
+      Math.max(0, innerWidth - visibleWidth(statusText)),
+    );
+    const headerWidth = visibleWidth(heading) + visibleWidth(statusText);
     const lines = [
-      this.theme.fg("border", "╭") +
-      this.theme.fg("accent", title) +
-      this.theme.fg("dim", modelTag) +
+      this.theme.fg("border", "╭") + heading +
       this.theme.fg("border", "─".repeat(Math.max(0, innerWidth - headerWidth))) +
       this.theme.fg(statusColor as any, statusText) +
       this.theme.fg("border", "╮"),
@@ -433,16 +514,22 @@ export class SubagentPeekOverlay {
       : `${contentLines.length}L`;
     const followIcon = this.followMode ? this.theme.fg("success", "●") : this.theme.fg("dim", "○");
     lines.push(this.theme.fg("border", "├" + "─".repeat(innerWidth) + "┤"));
-    const footer = ` ${scrollInfo} ${followIcon} │ ←/→ agent │ j/k scroll │ g/G top/end │ q close `;
+    const footer = truncateToWidth(` ${scrollInfo} ${followIcon} │ ←/→ agent │ j/k scroll │ g/G top/end │ q close `, innerWidth);
     lines.push(this.theme.fg("border", "│") + this.theme.fg("dim", footer) + " ".repeat(Math.max(0, innerWidth - visibleWidth(footer))) + this.theme.fg("border", "│"));
     lines.push(this.theme.fg("border", "╰" + "─".repeat(innerWidth) + "╯"));
     return lines;
   }
 
   dispose(): void {
+    if (this.disposed) return;
+    this.disposed = true;
     if (this.pollInterval) clearInterval(this.pollInterval);
     this.pollInterval = null;
-    this.socket?.end();
+    this.socket?.destroy();
     this.socket = null;
+    this.finishToolComponents();
+    this.cleanupStreaming();
+    this.chatContainer.clear();
+    this.invalidateCache();
   }
 }

@@ -1,7 +1,9 @@
-import type { ExtensionAPI, Theme } from "@earendil-works/pi-coding-agent";
+import type { ExtensionAPI, Theme, ToolRenderers } from "@earendil-works/pi-coding-agent";
 import {
+  createCodemodeExtension,
   DEFAULT_MAX_BYTES,
   DEFAULT_MAX_LINES,
+  defineTool,
   formatSize,
   truncateHead,
 } from "@earendil-works/pi-coding-agent";
@@ -80,7 +82,25 @@ function runtimeLabel(info: AgentInfo): string {
   return formatDuration(end - start);
 }
 
-export default function (pi: ExtensionAPI) {
+export default async function index_ (pi: ExtensionAPI) {
+  let nativeCodemodeRenderers: ToolRenderers = {};
+  // Collect only presentation hooks; never register or execute another codemode tool.
+  await createCodemodeExtension()({
+    ...pi,
+    registerTool(definition) {
+      if (definition.name !== "codemode") return;
+      const renderers = defineTool(definition);
+      nativeCodemodeRenderers = {
+        renderShell: renderers.renderShell,
+        renderCall: renderers.renderCall,
+        renderResult: renderers.renderResult,
+      };
+    },
+  });
+  if (!nativeCodemodeRenderers.renderCall || !nativeCodemodeRenderers.renderResult) {
+    throw new Error("Native codemode renderers are unavailable.");
+  }
+
   const widgetKey = "pi-codex-subagents";
   const completionMessageType = "pi-codex-subagent-completion";
   let cachedSkills: Array<{ name: string; description: string; filePath: string }> = [];
@@ -123,7 +143,7 @@ export default function (pi: ExtensionAPI) {
   };
 
   const refreshAgentWidget = () => {
-    if (!activeContext || activeContext.mode !== "tui") return;
+    if (activeContext?.mode !== "tui") return;
     const running = [...activeAgents];
     if (!running.length) {
       activeContext.ui.setWidget(widgetKey, undefined);
@@ -474,7 +494,11 @@ ${cachedSkills.length ? cachedSkills.map((skill) => `- \`${skill.name}\` — ${s
     catch (error) { ctx.ui.notify(error instanceof Error ? error.message : String(error), "error"); return; }
 
     while (true) {
-      const navigation = await ctx.ui.custom((tui: any, theme: any, _keybindings: any, done: any) => new SubagentPeekOverlay(tui, theme, info, done), {
+      const { terminal, outputPad } = pi.getSettings();
+      const navigation = await ctx.ui.custom((tui: any, theme: any, _keybindings: any, done: any) => new SubagentPeekOverlay(
+        tui, theme, info, done, nativeCodemodeRenderers,
+        { showImages: terminal?.showImages, imageWidthCells: terminal?.imageWidthCells, outputPad },
+      ), {
         overlay: true,
         overlayOptions: { anchor: "right-center", width: "45%", minWidth: 50, maxHeight: 60, margin: { right: 2, top: 2, bottom: 2 } },
       });

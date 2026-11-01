@@ -895,7 +895,10 @@ export class EventBroadcaster {
     } else if (event.type === "tool_execution_end" && event.toolCallId) {
       const active = this.activeTools.get(event.toolCallId);
       if (active) {
-        active.result = event.result;
+        active.result = {
+          ...event.result,
+          durationMs: event.durationMs ?? event.result?.durationMs,
+        };
         active.isError = event.isError ?? false;
       }
     } else if (event.type === "message_end") {

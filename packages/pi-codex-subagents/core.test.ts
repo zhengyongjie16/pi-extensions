@@ -1,17 +1,25 @@
 import { afterAll, afterEach, beforeEach, describe, expect, mock, test } from "bun:test";
 import { randomUUID } from "node:crypto";
+import { spawnSync } from "node:child_process";
 import { once } from "node:events";
 import { stripVTControlCharacters } from "node:util";
 import type { AgentInfo } from "./core.js";
+import type { ExtensionAPI, ToolExecutionComponent, ToolRenderers } from "@earendil-works/pi-coding-agent";
 import * as fs from "node:fs";
 import * as net from "node:net";
 import * as os from "node:os";
 import * as path from "node:path";
-import { visibleWidth } from "@earendil-works/pi-tui";
+import { TuiAltScreen, TuiMainScreen, visibleWidth, type Terminal } from "@earendil-works/pi-tui";
 
 // macOS os.tmpdir() can be too long for a Unix socket address; keep the POSIX root short.
 const TEST_AGENT_DIR = fs.mkdtempSync(path.join(process.platform === "win32" ? os.tmpdir() : "/tmp", "ps-"));
-const FAKE_RPC_CHILD = path.join(import.meta.dir, "test", "fake-rpc-child.js");
+const FAKE_RPC_SOURCE = path.join(import.meta.dir, "test", "fake-rpc-child.js");
+// Windows cannot spawn a shebang script directly; keep the executable fixture isolated.
+const FAKE_RPC_CHILD = process.platform === "win32" ? path.join(TEST_AGENT_DIR, "fake-rpc-child.exe") : FAKE_RPC_SOURCE;
+if (process.platform === "win32") {
+  const build = spawnSync(process.execPath, ["build", "--compile", FAKE_RPC_SOURCE, "--outfile", FAKE_RPC_CHILD], { encoding: "utf8" });
+  if (build.status !== 0) throw new Error(`Failed to compile the RPC test fixture: ${build.stderr}`);
+}
 const previousTempDir = process.env.PI_SUBAGENT_TEMP_DIR;
 process.env.PI_SUBAGENT_TEMP_DIR = TEST_AGENT_DIR;
 afterAll(() => {
@@ -44,6 +52,14 @@ const {
   taskStorageKey,
 } = await import("./core.js");
 const { formatAgentSpecLines, SubagentPeekOverlay } = await import("./peek.js");
+const nativeCodemodeRenderers: ToolRenderers = {};
+await codingAgent.createCodemodeExtension()({
+  registerTool(definition) {
+    Object.assign(nativeCodemodeRenderers, {
+      renderShell: definition.renderShell, renderCall: definition.renderCall, renderResult: definition.renderResult,
+    });
+  },
+} as ExtensionAPI);
 
 
 test("formats the resolved subagent model and thinking for the detail overlay", () => {
@@ -62,7 +78,8 @@ describe("RPC streaming", () => {
       api: "test",
       provider: "test",
       model: "fake",
-      usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, totalTokens: 0, cost: {} },
+      usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, totalTokens: 0,
+        cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 } },
       stopReason: "pending",
       timestamp: Date.now(),
     });
@@ -89,7 +106,12 @@ describe("RPC streaming", () => {
 });
 
 describe("RPC framing", () => {
-  test("explains quota errors that Node leaves unnamed", () => {
+  test("explains explicit quota error codes on every platform", () => {
+    expect(formatAgentError(Object.assign(new Error("write failed"), { code: "EDQUOT" })))
+      .toContain("Disk quota exceeded (EDQUOT).");
+  });
+
+  test.skipIf(os.constants.errno.EDQUOT === undefined)("explains quota errors that Node leaves unnamed", () => {
     const error = Object.assign(new Error(`Unknown system error -${os.constants.errno.EDQUOT}, write`), {
       errno: -os.constants.errno.EDQUOT,
     });
@@ -663,8 +685,8 @@ describe("startup retry failure recording", () => {
         expect(returnedError).toBeInstanceOf(Error);
         const message = returnedError!.message;
         expect(message).toContain("code=23");
-        if (attempt === 0 && priorStatus === "failed") expect(message).not.toBe(previous.error);
-        if (attempt === 1) expect(message).toBe(previous.error); // Identical causes are still distinct attempts.
+        if (attempt === 0 && priorStatus === "failed") expect(previous.error).not.toBe(message);
+        if (attempt === 1) expect(previous.error).toBe(message); // Identical causes are still distinct attempts.
         const failed = manager.getAgentInfo("worker", parentSessionId);
         expect(failed).toMatchObject({ status: "failed", error: message, messageCount: previous.messageCount });
         expect(failed.finalResponse).toBeUndefined();
@@ -792,7 +814,8 @@ describe("child process lifecycle", () => {
     process.env.PI_SUBAGENT_PI_BIN = FAKE_RPC_CHILD;
     const parentSessionId = "lifecycle-startup-failure";
     const scope = path.join(getRunsDir(), parentScopeKey(parentSessionId));
-    const socketDir = path.dirname(getSocketPath("11111111-1111-4111-8111-111111111111"));
+    // Marker files live in the isolated temp directory, not the Windows named-pipe namespace.
+    const socketDir = path.join(TEST_AGENT_DIR, "pi-codex-subagents", os.userInfo().username, "sockets");
     fs.rmSync(scope, { recursive: true, force: true });
     const manager = new AgentManager();
     await manager.ready();
@@ -910,7 +933,7 @@ describe("child process lifecycle", () => {
     }
   });
 
-  test("accepts Darwin process ownership when ps cannot expose the token", async () => {
+  test.skipIf(process.platform === "win32")("accepts Darwin process ownership when ps cannot expose the token", async () => {
     const platformDescriptor = Object.getOwnPropertyDescriptor(process, "platform")!;
     Object.defineProperty(process, "platform", { ...platformDescriptor, value: "darwin" });
     process.env.PI_SUBAGENT_PI_BIN = FAKE_RPC_CHILD;
@@ -1032,7 +1055,7 @@ describe("child process lifecycle", () => {
     const parentSessionId = "lifecycle-reconcile";
     fs.rmSync(path.join(getRunsDir(), parentScopeKey(parentSessionId)), { recursive: true, force: true });
     const owner = new AgentManager();
-    const reconcilers: AgentManager[] = [];
+    const reconcilers: Array<InstanceType<typeof AgentManager>> = [];
     try {
       await owner.spawnAgent(spawnParams(parentSessionId, "orphan", "hold orphan"));
       const orphanPid = owner.getAgentInfo("orphan", parentSessionId).childProcess!.pid;
@@ -1188,6 +1211,147 @@ describe("completion delivery", () => {
 });
 
 describe("extension completion delivery and TUI", () => {
+  test("collects native codemode renderers through the real extension API without registering or activating another tool", async () => {
+    const { default: subagentExtension } = await import("./index.js");
+    const accesses: PropertyKey[] = [];
+    let collected: ToolRenderers | undefined;
+    const loader = new codingAgent.DefaultResourceLoader({
+      cwd: TEST_AGENT_DIR, agentDir: TEST_AGENT_DIR,
+      settingsManager: codingAgent.SettingsManager.inMemory({}),
+      noExtensions: true, noSkills: true, noPromptTemplates: true, noThemes: true, noContextFiles: true,
+      extensionFactories: [
+        codingAgent.createCodemodeExtension(),
+        async (pi) => {
+          const registerTool = pi.registerTool;
+          // A diagnostic proxy over a complete real API checks the native factory's loading contract.
+          await codingAgent.createCodemodeExtension()(new Proxy({
+            ...pi,
+            registerTool(definition) {
+              expect(definition.name).toBe("codemode");
+              const renderers = codingAgent.defineTool(definition);
+              collected = {
+                renderShell: renderers.renderShell, renderCall: renderers.renderCall, renderResult: renderers.renderResult,
+              };
+            },
+          }, {
+            get(target, key, receiver) {
+              accesses.push(key);
+              return Reflect.get(target, key, receiver);
+            },
+          }));
+          await subagentExtension(pi);
+          expect(pi.registerTool).toBe(registerTool);
+        },
+      ],
+    });
+    try {
+      await loader.reload();
+      const loaded = loader.getExtensions();
+      expect(loaded.errors).toEqual([]);
+      expect(loaded.extensions).toHaveLength(2);
+      expect(accesses).toEqual(["registerTool"]);
+      const [native, subagents] = loaded.extensions;
+      const definition = native.tools.get("codemode")!.definition;
+      expect(definition.defaultActive).toBe(false);
+      expect(collected!.renderCall).toBe(definition.renderCall);
+      expect(collected!.renderResult).toBe(definition.renderResult);
+      expect([...native.tools.keys()]).toEqual(["codemode"]);
+      expect([...subagents.tools.keys()]).toEqual([
+        "spawn_agent", "wait_agent", "wait_all_agents", "list_agents", "read_agent_response", "send_message", "interrupt_agent",
+      ]);
+      // Session actions are still unbound: initialization did not activate tools or execute scripts.
+      expect(() => loaded.runtime.getActiveTools()).toThrow("Extension runtime not initialized");
+
+      // Exercise index.ts's actual overlay entry with current host display settings.
+      const parentId = "renderer-contract-parent";
+      const scope = path.join(getRunsDir(), parentScopeKey(parentId));
+      fs.mkdirSync(scope, { recursive: true });
+      const id = randomUUID();
+      const info: AgentInfo = {
+        id, parentSessionId: parentId, taskName: "contract", canonicalName: "/contract", status: "completed",
+        cwd: TEST_AGENT_DIR, provider: "test", modelId: "fake", model: "test:fake",
+        createdAt: Date.now(), updatedAt: Date.now(), messageCount: 0,
+        sessionFile: path.join(scope, `${id}.jsonl`), infoFile: path.join(scope, `${id}.info.json`),
+        logFile: path.join(scope, `${id}.log`),
+      };
+      fs.writeFileSync(info.infoFile, JSON.stringify(info));
+      const settings = { terminal: { showImages: false, imageWidthCells: 42 }, outputPad: 0 as const };
+      loaded.runtime.getSettings = mock(() => settings);
+      let opened = 0;
+      const ctx: any = {
+        mode: "tui", sessionManager: { getSessionId: () => parentId },
+        ui: {
+          async custom(create: any) {
+            const component = create({ terminal: { rows: 80 }, requestRender() {} },
+              { fg: (_color: string, text: string) => text, bold: (text: string) => text }, {}, () => {});
+            if (opened++ === 0) return { task: "contract", parentSessionId: parentId, includeAll: false };
+            try {
+              expect(component).toBeInstanceOf(SubagentPeekOverlay);
+              expect(component["nativeCodemodeRenderers"]).toEqual(collected);
+              expect(Object.keys(component["nativeCodemodeRenderers"])).toEqual(["renderShell", "renderCall", "renderResult"]);
+              expect(component["toolExecutionOptions"]).toEqual({ showImages: false, imageWidthCells: 42, outputPad: 0 });
+              component.handleInput("\x0f");
+              expect(component["disposed"]).toBe(false);
+            } finally {
+              component.dispose();
+            }
+            return undefined;
+          },
+        },
+      };
+      try {
+        await subagents.commands.get("subagents")!.handler("", ctx);
+        expect(opened).toBe(2);
+        expect(loaded.runtime.getSettings).toHaveBeenCalledTimes(1);
+      } finally {
+        fs.rmSync(scope, { recursive: true, force: true });
+      }
+    } finally {
+      for (const extension of loader.getExtensions().extensions) {
+        for (const shutdown of extension.handlers.get("session_shutdown") ?? []) {
+          await shutdown({ type: "session_shutdown" }, {} as any);
+        }
+      }
+    }
+  });
+
+  test("loads the TypeScript extension entry through Pi's file loader in an isolated process", () => {
+    const agentDir = fs.mkdtempSync(path.join(TEST_AGENT_DIR, "file-loader-"));
+    const source = `
+      import { DefaultResourceLoader, SettingsManager } from "@earendil-works/pi-coding-agent";
+      const loader = new DefaultResourceLoader({
+        cwd: ${JSON.stringify(agentDir)}, agentDir: ${JSON.stringify(agentDir)},
+        settingsManager: SettingsManager.inMemory({}),
+        additionalExtensionPaths: [${JSON.stringify(path.join(import.meta.dir, "index.ts"))}],
+        noExtensions: true, noSkills: true, noPromptTemplates: true, noThemes: true, noContextFiles: true,
+      });
+      try {
+        await loader.reload();
+        const loaded = loader.getExtensions();
+        if (loaded.errors.length) throw new Error(JSON.stringify(loaded.errors));
+        console.log(JSON.stringify(loaded.extensions.map(extension => [...extension.tools.keys()])));
+      } finally {
+        for (const extension of loader.getExtensions().extensions) {
+          for (const shutdown of extension.handlers.get("session_shutdown") ?? []) {
+            await shutdown({ type: "session_shutdown" }, {});
+          }
+        }
+      }
+    `;
+    try {
+      const probe = spawnSync(process.execPath, ["--eval", source], {
+        cwd: import.meta.dir, encoding: "utf8", timeout: 30_000,
+        env: { ...process.env, PI_CODING_AGENT_DIR: agentDir, PI_SUBAGENT_TEMP_DIR: agentDir },
+      });
+      if (probe.status !== 0) throw new Error(`Pi file-loader check failed: ${probe.error ?? probe.stderr}`);
+      expect(JSON.parse(probe.stdout)).toEqual([[
+        "spawn_agent", "wait_agent", "wait_all_agents", "list_agents", "read_agent_response", "send_message", "interrupt_agent",
+      ]]);
+    } finally {
+      fs.rmSync(agentDir, { recursive: true, force: true });
+    }
+  });
+
   test.each([undefined, "", "ctrl+shift+a"])("opens the browser with optional shortcut %s", async (shortcut) => {
     const configFile = path.join(TEST_AGENT_DIR, "pi-codex-subagents", "config.json");
     fs.mkdirSync(path.dirname(configFile), { recursive: true });
@@ -1211,7 +1375,7 @@ describe("extension completion delivery and TUI", () => {
     };
     const { default: subagentExtension } = await import("./index.js");
     try {
-      subagentExtension({
+      await subagentExtension({
         on(name: string, handler: any) { if (name === "session_shutdown") shutdown = handler; },
         registerTool() {},
         registerMessageRenderer() {},
@@ -1252,6 +1416,7 @@ describe("extension completion delivery and TUI", () => {
       sendMessage(message: any, options: any) { sentMessages.push({ message, options }); },
       getThinkingLevel() { return "high"; },
       getActiveTools() { return ["read", "bash"]; },
+      getSettings() { return { terminal: { showImages: false, imageWidthCells: 42 }, outputPad: 0 }; },
     };
     const parentSessionId = "index-integration-parent";
     const availableModels = [
@@ -1287,7 +1452,7 @@ describe("extension completion delivery and TUI", () => {
     // A thinking suffix on an allowlist entry is tolerated and stripped from the offered pair.
     fs.writeFileSync(configFile, JSON.stringify({ models: ["test/fake:high", "typo/nope"], modelsFromEnabledModels: true }));
     const { default: subagentExtension } = await import("./index.js");
-    subagentExtension(pi);
+    await subagentExtension(pi);
     const emit = async (name: string, event: any = {}) => {
       for (const handler of handlers.get(name) ?? []) await handler(event, ctx);
     };
@@ -1525,7 +1690,7 @@ describe("observer broadcast", () => {
   const end = (id: string, result: any, isError = false) => ({
     type: "tool_execution_end", toolCallId: id, toolName: "codemode", result, isError,
   });
-  const textResult = (text: string) => ({ content: [{ type: "text", text }], details: {} });
+  const textResult = (text: string) => ({ content: [{ type: "text" as const, text }], details: {} });
   const messageEnd = (id: string) => ({
     type: "message_end", message: { role: "toolResult", toolCallId: id },
   });
@@ -1598,18 +1763,29 @@ describe("observer broadcast", () => {
       .toEqual([["top/read", "read"], ["top/shell", "powershell"], ["top/mcp", "mcp__docs"]]);
   });
 
-  test.each([false, true])("retains a finished parent's result until its toolResult message (isError=%s)", async (isError) => {
-    const result = { ...textResult("final script output"), details: { calls: [], elapsed: 42 } };
-    const inputs = [start("parent"), end("parent", result, isError)] as const;
+  test.each([
+    { isError: false },
+    { isError: true },
+    { isError: false, durationMs: 84, resultDurationMs: 42, expectedDurationMs: 84 },
+    { isError: true, resultDurationMs: 42, expectedDurationMs: 42 },
+    { isError: false, durationMs: 0, resultDurationMs: 42, expectedDurationMs: 0 },
+    { isError: true, resultDurationMs: 0, expectedDurationMs: 0 },
+  ])("retains a finished parent's result until its toolResult message (%j)", async ({ isError, durationMs, resultDurationMs, expectedDurationMs }) => {
+    const result = { ...textResult("final script output"), details: { calls: [], elapsed: 42 }, durationMs: resultDurationMs };
+    const inputs = [start("parent"), { ...end("parent", result, isError), durationMs }] as const;
     const original = JSON.stringify(inputs);
+    const cachedTool = {
+      toolCallId: "parent", toolName: "codemode", args: inputs[0].args,
+      result: { ...result, durationMs: expectedDurationMs }, isError,
+    };
     emit(...inputs);
-    expect((await snapshot()).activeTools).toEqual([{
-      toolCallId: "parent", toolName: "codemode", args: inputs[0].args, result, isError,
-    }]);
+    expect((await snapshot()).activeTools).toEqual([cachedTool]);
+    emit(messageEnd("unrelated"));
+    expect((await snapshot()).activeTools).toEqual([cachedTool]);
     // message_end is the existing event handoff, not a disk-write acknowledgement.
     emit(messageEnd("parent"));
     expect((await snapshot()).activeTools).toEqual([]);
-    expect(await flush()).toEqual([...inputs, messageEnd("parent")]);
+    expect(await flush()).toEqual([...inputs, messageEnd("unrelated"), messageEnd("parent")]);
     expect(JSON.stringify(inputs)).toBe(original);
   });
 
@@ -1666,12 +1842,15 @@ describe("observer broadcast", () => {
   test.each(["aborted", "error"])("preserves failure/interruption and settled cleanup (%s)", async (stopReason) => {
     const values = [
       start("parent"),
-      end("parent", textResult("Operation failed"), true),
+      { ...end("parent", textResult("Operation failed"), true), durationMs: 42 },
       { type: "message_end", message: { role: "assistant", content: [], stopReason, errorMessage: "Operation failed" } },
       { type: "agent_end", messages: [] },
     ];
     emit(...values);
-    expect((await snapshot()).activeTools).toHaveLength(1);
+    expect((await snapshot()).activeTools).toEqual([{
+      toolCallId: "parent", toolName: "codemode", args: { code: "script" },
+      result: { ...textResult("Operation failed"), durationMs: 42 }, isError: true,
+    }]);
     emit({ type: "agent_settled" },
       nested(start("late/child", "read"), "finished-parent"),
       nested(end("late/child", textResult("late nested failure"), true), "finished-parent"));
@@ -1748,6 +1927,197 @@ describe("observer broadcast", () => {
     }
   });
 
+  test.each(["regular", "fullscreen"] as const)("isolated native %s TUI handles live socket previews, input, reopen, resize and offline recovery", async (mode) => {
+    codingAgent.initTheme("dark", false);
+    const sessionDir = fs.mkdtempSync(path.join(TEST_AGENT_DIR, "tui-session-"));
+    const session = codingAgent.SessionManager.create(TEST_AGENT_DIR, sessionDir);
+    session.appendMessage({ role: "user", content: "isolated TUI task", timestamp: Date.now() });
+    const args = { code: 'await Promise.allSettled([tools.read({ path: "中文.txt" })]);' };
+    const assistant: any = {
+      role: "assistant", content: [{ type: "toolCall", id: "tui-call", name: "codemode", arguments: args }],
+      api: "test", provider: "test", model: "fake", stopReason: "toolUse", timestamp: Date.now(),
+      usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, totalTokens: 0,
+        cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 } },
+    };
+    session.appendMessage(assistant);
+    const partial = { ...textResult("hidden partial text"), details: { calls: [
+      { name: "nested/read", args: "path=中文.txt", status: "running" },
+    ] } };
+    emit(start("tui-call", "codemode", args), update("tui-call", partial));
+    const info = { id: agentId, taskName: "isolated TUI", provider: "test", modelId: "fake",
+      cwd: TEST_AGENT_DIR, sessionFile: session.getSessionFile()! } as AgentInfo;
+    let input: (data: string) => void = () => {};
+    let resize = () => {};
+    const writes: string[] = [];
+    const terminal: Terminal & { columns: number; rows: number } = {
+      columns: 120, rows: 35, kittyProtocolActive: false,
+      start(onInput, onResize) { input = onInput; resize = onResize; },
+      stop() {}, async drainInput() {}, write(data) { writes.push(data); },
+      moveBy() {}, hideCursor() {}, showCursor() {}, clearLine() {}, clearFromCursor() {},
+      clearScreen() {}, setTitle() {}, setProgress() {}, setProgramStatus() {},
+    };
+    const tui = mode === "regular" ? new TuiMainScreen(terminal) : new TuiAltScreen(terminal);
+    const navigation: Array<"previous" | "next" | undefined> = [];
+    let overlay: InstanceType<typeof SubagentPeekOverlay>;
+    let hide = () => {};
+    const mount = async () => {
+      overlay = new SubagentPeekOverlay(tui, { fg: (_color: string, text: string) => text } as any,
+        info, (value) => { navigation.push(value); hide(); }, nativeCodemodeRenderers, { outputPad: 0, showImages: false });
+      overlays.push(overlay);
+      const socket = overlay["socket"]!;
+      await once(socket, "data"); // genuine sync arrives over the isolated socket/named pipe
+      const handle = tui.showOverlay(overlay, { anchor: "right-center", width: "80%", minWidth: 38, maxHeight: 31 });
+      hide = () => { overlay.dispose(); handle.hide(); };
+      writes.length = 0;
+      tui.renderNow(true);
+    };
+    const tool = () => overlay!["chatContainer"].children.find(
+      (child) => child instanceof codingAgent.ToolExecutionComponent,
+    ) as ToolExecutionComponent;
+    const output = () => stripVTControlCharacters(writes.join(""));
+    const draw = () => {
+      writes.length = 0;
+      tui.renderNow(true);
+      return output();
+    };
+    tui.start();
+    try {
+      await mount();
+      expect(output()).toContain("… nested/read");
+      expect(tool()["expanded"]).toBe(false);
+      expect(tool()["executionStarted"]).toBe(true);
+      input("\x0f"); // Ctrl+O stays inside the overlay, not the main tools-expand action.
+      if (mode === "fullscreen") {
+        input("\x1b[<0;70;15M");
+        input("\x1b[<0;70;15m");
+      }
+      expect(tool()["expanded"]).toBe(false);
+      for (const key of ["k", "j", "g", "G"]) input(key);
+      terminal.columns = 55;
+      resize();
+      expect(draw()).toContain("nested/read");
+      terminal.columns = 120;
+      resize();
+      overlay!.invalidate();
+      expect(draw()).toContain("… nested/read");
+      expect(tool()["expanded"]).toBe(false);
+      input("q");
+      expect(overlay!["disposed"]).toBe(true);
+      await mount();
+      expect(output()).toContain("… nested/read");
+      expect(tool()["executionStarted"]).toBe(true);
+
+      const result = { ...textResult("tui_final_output"), details: { calls: [
+        { name: "nested/read", args: "path=中文.txt", status: "error", error: "caught failure", durationMs: 15 },
+      ] } };
+      const original = structuredClone(result);
+      emit({ ...end("tui-call", result), durationMs: 2600 });
+      await waitUntil(() => !overlay!["pendingTools"].has("tui-call"));
+      draw();
+      expect(output()).toContain("✗ nested/read");
+      expect(output()).toContain("tui_final_output");
+      expect(output()).toContain("Took 2.6s");
+      expect(tool()["result"]!.isError).toBe(false);
+      expect(result).toEqual(original);
+      const finalMessage: any = { role: "toolResult", toolCallId: "tui-call", toolName: "codemode",
+        ...result, durationMs: 2600, isError: false, timestamp: Date.now() };
+      emit({ type: "message_end", message: finalMessage });
+      session.appendMessage(finalMessage);
+      emit({ type: "agent_settled" });
+      await waitUntil(() => overlay!["status"] === "done");
+      input("\x1b[D");
+      expect(overlay!["disposed"]).toBe(true);
+      await mount();
+      expect(output()).toContain("tui_final_output");
+      expect(tool()["executionStarted"]).toBe(false); // history must not invent a fresh clock
+      expect(tool()["expanded"]).toBe(false);
+      input("\x1b[C");
+      await mount();
+      expect(output()).toContain("tui_final_output");
+      expect(tool()["expanded"]).toBe(false);
+      expect(navigation).toEqual([undefined, "previous", "next"]);
+
+      const closed = once(broadcaster["server"]!, "close");
+      broadcaster.stop();
+      await closed;
+      await waitUntil(() => overlay!["socket"] === null);
+      session.appendMessage({ role: "user", content: "offline TUI file update", timestamp: Date.now() });
+      overlay!["poll"]();
+      overlay!.handleInput("G");
+      draw();
+      expect(output()).toContain("offline TUI file update");
+      expect(codingAgent.SessionManager.open(info.sessionFile).buildSessionContext().messages
+        .find((message) => message.role === "toolResult")).toMatchObject(finalMessage);
+      input("q");
+    } finally {
+      hide();
+      tui.stop();
+    }
+  });
+
+  test("defers file rebuilds only for executing rows and resumes deferred or disconnected file recovery", async () => {
+    codingAgent.initTheme("dark", false);
+    const sessionDir = fs.mkdtempSync(path.join(TEST_AGENT_DIR, "poll-session-"));
+    const session = codingAgent.SessionManager.create(TEST_AGENT_DIR, sessionDir);
+    session.appendMessage({ role: "user", content: "isolated polling task", timestamp: Date.now() });
+    const calls = ["file-only", "a", "c"].map((id) => ({
+      type: "toolCall" as const, id, name: "custom_tool", arguments: { task: id },
+    }));
+    const assistant: any = {
+      role: "assistant", content: calls, api: "test", provider: "test", model: "fake",
+      stopReason: "toolUse", timestamp: Date.now(),
+      usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, totalTokens: 0,
+        cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 } },
+    };
+    session.appendMessage(assistant);
+    emit(start("a", "custom_tool", calls[1].arguments), start("c", "custom_tool", calls[2].arguments));
+    const info = { id: agentId, taskName: "polling", provider: "test", modelId: "fake",
+      cwd: TEST_AGENT_DIR, sessionFile: session.getSessionFile()! } as AgentInfo;
+    const overlay = new SubagentPeekOverlay({ terminal: { rows: 80 }, requestRender() {} } as any,
+      { fg: (_color: string, text: string) => text } as any, info, () => {}, nativeCodemodeRenderers);
+    overlays.push(overlay);
+    await waitUntil(() => overlay["pendingTools"].get("c")?.executing === true);
+    const a = overlay["pendingTools"].get("a")!.component;
+    const c = overlay["pendingTools"].get("c")!.component;
+    expect(overlay["pendingTools"].get("file-only")!.executing).toBe(false);
+    const persistedResult = (id: string, text: string) => ({
+      role: "toolResult" as const, toolCallId: id, toolName: "custom_tool", ...textResult(text),
+      isError: false, durationMs: 100, timestamp: Date.now(),
+    });
+
+    // A stale historical row is still pending, but its file result arrives while real calls run.
+    session.appendMessage(persistedResult("file-only", "file_only_result"));
+    overlay["poll"]();
+    expect(overlay["historyDirty"]).toBe(true);
+    expect(overlay["pendingTools"].get("a")!.component).toBe(a);
+    expect(overlay["pendingTools"].get("c")!.component).toBe(c);
+    emit(end("a", textResult("a result")));
+    await waitUntil(() => !overlay["pendingTools"].has("a"));
+    overlay["poll"]();
+    expect(overlay["pendingTools"].get("c")!.component).toBe(c);
+    session.appendMessage(persistedResult("a", "a result"));
+    overlay["poll"]();
+    const deferredSize = overlay["lastFileSize"];
+    emit(end("c", textResult("c result")));
+    await waitUntil(() => !overlay["pendingTools"].has("c"));
+    overlay["poll"]();
+    expect(overlay["lastFileSize"]).toBe(deferredSize); // no later file growth was needed
+    expect(overlay["historyDirty"]).toBe(false);
+    expect(overlay["pendingTools"].has("file-only")).toBe(false);
+    expect(stripVTControlCharacters(overlay.render(120).join("\n"))).toContain("file_only_result");
+
+    // A reconnected execution reuses the unresolved historical row; disconnect permits file fallback.
+    emit(start("c", "custom_tool", calls[2].arguments));
+    await waitUntil(() => overlay["pendingTools"].get("c")?.executing === true);
+    session.appendMessage(persistedResult("c", "disconnected_file_result"));
+    overlay["socket"]!.destroy();
+    await waitUntil(() => overlay["socket"] === null && !overlay["pendingTools"].has("c"));
+    expect(stripVTControlCharacters(overlay.render(120).join("\n"))).toContain("disconnected_file_result");
+    session.appendMessage({ role: "user", content: "offline_file_tail", timestamp: Date.now() });
+    overlay["poll"]();
+    expect(stripVTControlCharacters(overlay.render(120).join("\n"))).toContain("offline_file_tail");
+  });
+
   test("renders live, reconnect and persisted history with the same top-level ownership", async () => {
     codingAgent.initTheme("dark", false);
     const sessionDir = fs.mkdtempSync(path.join(TEST_AGENT_DIR, "observer-session-"));
@@ -1761,7 +2131,7 @@ describe("observer broadcast", () => {
     const open = async (expectSync = true) => {
       const overlay = new SubagentPeekOverlay({
         terminal: { rows: 80 }, requestRender() {},
-      } as any, { fg: (_color: string, text: string) => text } as any, info, (value) => navigation.push(value));
+      } as any, { fg: (_color: string, text: string) => text } as any, info, (value) => navigation.push(value), nativeCodemodeRenderers);
       overlays.push(overlay);
       const socket = overlay["socket"]!;
       sockets.push(socket);
@@ -1801,8 +2171,10 @@ describe("observer broadcast", () => {
     emit(parent,
       nested(start("script/1", "read", { path: "nested.txt" }), "script"),
       nested(start("script/2", "powershell", { command: "echo nested" }), "script"),
-      update("script", textResult("parent progress")));
-    await waitUntil(() => render(overlay).includes("parent progress"));
+      update("script", { ...textResult("parent progress"), details: { calls: [
+        { name: "nested/read", args: "path=nested.txt", status: "running" },
+      ] } }));
+    await waitUntil(() => render(overlay).includes("… nested/read"));
     expect(tools(overlay)).toHaveLength(1);
     expect(overlay["pendingTools"].has("script/1")).toBe(false);
     expect(overlay["pendingTools"].has("script/2")).toBe(false);
@@ -1810,8 +2182,13 @@ describe("observer broadcast", () => {
     overlay.dispose();
     overlay = await open();
     expect(tools(overlay)).toHaveLength(1);
-    expect(render(overlay)).toContain("parent progress");
-    const result = textResult("final script output");
+    expect(render(overlay)).toContain("… nested/read");
+    expect(render(overlay)).not.toContain("parent progress");
+    const result = { ...textResult("final script output"), durationMs: 1234, details: { calls: [
+      { name: "nested/read", args: "path=nested.txt", status: "ok", durationMs: 12 },
+      { name: "nested/powershell", args: "command=echo nested", status: "error", durationMs: 23, error: "caught error" },
+      { name: "nested/cancelled", args: "", status: "cancelled" },
+    ] } };
     emit(nested(end("script/1", textResult("nested file")), "script"),
       nested(end("script/2", textResult("nested shell")), "script"),
       end("script", result));
@@ -1820,6 +2197,16 @@ describe("observer broadcast", () => {
     overlay = await open();
     expect(tools(overlay)).toHaveLength(1);
     expect(render(overlay)).toContain("final script output");
+    expect(render(overlay)).toContain("✓ nested/read");
+    expect(render(overlay)).toContain("✗ nested/powershell");
+    expect(render(overlay)).toContain("⊘ nested/cancelled");
+    expect(render(overlay)).toContain("Took 1.2s");
+    const reference = new codingAgent.ToolExecutionComponent("codemode", "script", parent.args, {},
+      nativeCodemodeRenderers, { requestRender() {} } as any, TEST_AGENT_DIR);
+    reference.setExpanded(false);
+    reference.setArgsComplete();
+    reference.updateResult({ ...result, isError: false }, false);
+    expect(tools(overlay)[0].render(118)).toEqual(reference.render(118));
 
     const toolResult: any = { role: "toolResult", toolCallId: "script", toolName: "codemode", ...result, isError: false, timestamp: Date.now() };
     emit({ type: "message_end", message: toolResult });
