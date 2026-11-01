@@ -1,4 +1,4 @@
-import type { Theme, ToolDefinition, ToolExecutionOptions, ToolRenderers } from "@earendil-works/pi-coding-agent";
+import type { ContextUsage, Theme, ToolDefinition, ToolExecutionOptions, ToolRenderers } from "@earendil-works/pi-coding-agent";
 import {
   AssistantMessageComponent,
   createBashToolDefinition,
@@ -26,8 +26,11 @@ import {
 import * as fs from "node:fs";
 import * as net from "node:net";
 import {
+  formatContextUsage,
   getSocketPath,
   isPeekActive,
+  normalizeContextUsage,
+  readInfoFile,
   RpcAssistantStreamState,
   type AgentInfo,
   type RpcAssistantStreamStatus,
@@ -63,6 +66,8 @@ export class SubagentPeekOverlay {
   private readonly modelName: string;
   private sessionManager: SessionManager | null = null;
   private lastFileSize = 0;
+  private contextUsage: ContextUsage | undefined;
+  private lastInfoReadAt: number;
   private historyDirty = false; // A loaded snapshot may still await replay after live execution.
   private readonly chatContainer = new Container();
   private scrollOffset = 0;
@@ -103,6 +108,8 @@ export class SubagentPeekOverlay {
     this.sessionFile = info.sessionFile;
     this.cwd = info.cwd;
     this.modelName = info.modelId || info.model;
+    this.contextUsage = normalizeContextUsage(info.contextUsage);
+    this.lastInfoReadAt = Date.now();
     this.loadSession();
     this.rebuildChat();
     this.connectSocket();
@@ -202,6 +209,8 @@ export class SubagentPeekOverlay {
       socket.on("close", () => {
         if (this.disposed || this.socket !== socket) return;
         this.socket = null;
+        this.refreshContextUsage();
+        if (this.disposed) return;
         this.status = "done";
         this.cleanupStreaming();
         this.loadSession();
@@ -224,7 +233,7 @@ export class SubagentPeekOverlay {
   }
 
   private handleEvent(event: any): void {
-    if (this.disposed) return;
+    if (this.disposed || event.type === "response") return;
     if (event.type === "sync") {
       this.loadSession();
       this.rebuildChat();
@@ -401,7 +410,21 @@ export class SubagentPeekOverlay {
     this.pendingTools.clear();
   }
 
+  private refreshContextUsage(): boolean {
+    if (this.disposed) return false;
+    this.lastInfoReadAt = Date.now();
+    const info = readInfoFile(this.info.infoFile);
+    if (this.disposed || !info) return false;
+    const next = normalizeContextUsage(info.contextUsage);
+    if (next?.contextWindow === this.contextUsage?.contextWindow &&
+      next?.tokens === this.contextUsage?.tokens && next?.percent === this.contextUsage?.percent) return false;
+    this.contextUsage = next;
+    return true;
+  }
+
   private poll(): void {
+    if (this.disposed) return;
+    if (Date.now() - this.lastInfoReadAt >= 1000 && this.refreshContextUsage()) this.tui.requestRender();
     if (this.disposed) return;
     if (!this.socket && isPeekActive(this.info.id) && Date.now() - this.lastConnectAttemptAt >= 2000) this.connectSocket();
     try {
@@ -470,12 +493,13 @@ export class SubagentPeekOverlay {
 
   render(width: number): string[] {
     if (this.disposed) return [];
-    const innerWidth = Math.max(20, width - 2);
+    if (width < 3) return [];
+    const innerWidth = width - 2;
     const title = ` ${this.info.taskName} `;
     const modelTag = this.modelName ? `[${truncateToWidth(this.modelName, 18)}] ` : "";
     const statusIcon = { thinking: "◐", streaming: "●", calling: "◒", tool: "◑", done: "✓" }[this.status];
     const statusColor = { thinking: "warning", streaming: "success", calling: "accent", tool: "accent", done: "success" }[this.status];
-    const statusText = ` ${statusIcon} ${this.status} `;
+    const statusText = truncateToWidth(` ${statusIcon} ${this.status} `, innerWidth);
     const heading = truncateToWidth(
       this.theme.fg("accent", title) + this.theme.fg("dim", modelTag),
       Math.max(0, innerWidth - visibleWidth(statusText)),
@@ -498,7 +522,7 @@ export class SubagentPeekOverlay {
     }
 
     const maxHeight = Math.min(60, Math.max(8, this.tui.terminal.rows - 4));
-    const maxVisible = Math.max(4, maxHeight - 4);
+    const maxVisible = maxHeight - 4;
     const maxScroll = Math.max(0, contentLines.length - maxVisible);
     this.scrollOffset = Math.min(this.scrollOffset, maxScroll);
     const visible = contentLines.slice(this.scrollOffset, this.scrollOffset + maxVisible);
@@ -514,7 +538,7 @@ export class SubagentPeekOverlay {
       : `${contentLines.length}L`;
     const followIcon = this.followMode ? this.theme.fg("success", "●") : this.theme.fg("dim", "○");
     lines.push(this.theme.fg("border", "├" + "─".repeat(innerWidth) + "┤"));
-    const footer = truncateToWidth(` ${scrollInfo} ${followIcon} │ ←/→ agent │ j/k scroll │ g/G top/end │ q close `, innerWidth);
+    const footer = truncateToWidth(` ${scrollInfo} ${followIcon} │ ${formatContextUsage(this.contextUsage)} │ ←/→ agent │ j/k scroll │ g/G top/end │ q close `, innerWidth);
     lines.push(this.theme.fg("border", "│") + this.theme.fg("dim", footer) + " ".repeat(Math.max(0, innerWidth - visibleWidth(footer))) + this.theme.fg("border", "│"));
     lines.push(this.theme.fg("border", "╰" + "─".repeat(innerWidth) + "╯"));
     return lines;

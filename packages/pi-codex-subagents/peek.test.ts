@@ -19,14 +19,20 @@ import {
   type ToolExecutionOptions,
   type ToolRenderers,
 } from "@earendil-works/pi-coding-agent";
-import { getCapabilities, getCellDimensions, setCapabilities, setCellDimensions, visibleWidth, type TUI } from "@earendil-works/pi-tui";
+import {
+  getCapabilities, getCellDimensions, setCapabilities, setCellDimensions, TuiAltScreen, TuiMainScreen,
+  visibleWidth, type Terminal, type TUI,
+} from "@earendil-works/pi-tui";
 import type { AssistantMessage, JsonObject } from "@earendil-works/pi-ai";
 import * as fs from "node:fs";
+import * as net from "node:net";
 import { randomUUID } from "node:crypto";
+import { EventEmitter } from "node:events";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { stripVTControlCharacters } from "node:util";
 import { SubagentPeekOverlay } from "./peek.js";
+import type { AgentInfo } from "./core.js";
 
 const widths = [38, 80, 100];
 const cwd = process.cwd();
@@ -167,7 +173,10 @@ function toolRows(overlay: SubagentPeekOverlay): ToolExecutionComponent[] {
   return overlay["chatContainer"].children.filter((child): child is ToolExecutionComponent => child instanceof ToolExecutionComponent);
 }
 
-function createOverlay(options: ToolExecutionOptions = {}, sessionFile?: string, wrapTui: (tui: TUI) => TUI = (tui) => tui) {
+function createOverlay(
+  options: ToolExecutionOptions = {}, sessionFile?: string, wrapTui: (tui: TUI) => TUI = (tui) => tui,
+  info: Partial<AgentInfo> = {},
+) {
   const requestRender = mock(() => {});
   const done = mock((_navigation?: "previous" | "next") => {});
   const tui = wrapTui({ terminal: { rows: 90 }, requestRender } as unknown as TUI);
@@ -179,12 +188,34 @@ function createOverlay(options: ToolExecutionOptions = {}, sessionFile?: string,
       id: "peek-unit-" + randomUUID(), taskName: "rendering", provider: "test",
       modelId: "fake", model: "test:fake", thinking: "off", cwd,
       sessionFile: sessionFile ?? join(tmpdir(), "peek-absent-" + randomUUID() + ".jsonl"),
+      infoFile: join(tmpdir(), "peek-absent-" + randomUUID() + ".info.json"),
+      ...info,
     } as any, done, nativeCodemodeRenderers, options);
   } finally {
     connect.mockRestore();
   }
   overlays.push(overlay);
   return { overlay, requestRender, done, tui };
+}
+
+const savedContextUsage = { tokens: 50_000, contextWindow: 500_000, percent: 10 };
+
+function createSavedOverlay(contextUsage: unknown = savedContextUsage, wrapTui?: (tui: TUI) => TUI) {
+  const directory = fs.mkdtempSync(join(tmpdir(), "pi-peek-context-"));
+  temporaryDirectories.push(directory);
+  const session = SessionManager.create(cwd, directory);
+  session.appendMessage(assistant([{ type: "text", text: lines("chat_line_", 100) }]));
+  const infoFile = join(directory, "agent.info.json");
+  const state = createOverlay({}, session.getSessionFile()!, wrapTui, { infoFile, contextUsage: contextUsage as any });
+  const writeInfo = (fields: Record<string, unknown>) => fs.writeFileSync(infoFile, JSON.stringify({
+    ...state.overlay["info"], contextUsage: undefined, ...fields,
+  }));
+  writeInfo({ contextUsage });
+  return { ...state, session, infoFile, writeInfo };
+}
+
+function contextLine(overlay: SubagentPeekOverlay, width = 80): string {
+  return stripVTControlCharacters(overlay.render(width).at(-2)!);
 }
 
 function controlledClock() {
@@ -478,6 +509,430 @@ describe("fixed native collapsed rendering", () => {
       setCapabilities(previousCaps);
       setCellDimensions(previousCells);
     }
+  });
+});
+
+describe("footer context information and metadata polling", () => {
+  beforeEach(() => { clock = controlledClock(); });
+
+  test.each([
+    [undefined, "?%/?"],
+    [savedContextUsage, "10%/500k"],
+    [{ tokens: 0, contextWindow: 500_000, percent: 0 }, "0%/500k"],
+    [{ tokens: 52_000, contextWindow: 500_000, percent: 10.4 }, "10.4%/500k"],
+    [{ tokens: 1, contextWindow: 500_000, percent: 0.0002 }, "<0.1%/500k"],
+    [{ tokens: 525_000, contextWindow: 500_000, percent: 105 }, "105%/500k"],
+    [{ tokens: null, contextWindow: 1_050_000, percent: null }, "?%/1.05M"],
+    [{ tokens: 50_000, contextWindow: 500_000, percent: "10" }, "?%/500k"],
+    [{ contextWindow: 500_000, percent: 10 }, "?%/500k"],
+    [{ tokens: 0, contextWindow: 0, percent: 0 }, "?%/?"],
+    ["malformed snapshot", "?%/?"],
+  ])("uses the saved snapshot and shared normalization/formatting: %j", (usage, expected) => {
+    const input = freeze(usage);
+    const original = structuredClone(input);
+    const { overlay, requestRender } = createOverlay({}, undefined, undefined, { contextUsage: input as any });
+    const rendered = overlay.render(80).map(stripVTControlCharacters);
+    expect(rendered.at(-2)).toStartWith(`│ 3L ● │ ${expected} │ ←/→ agent │`);
+    expect(rendered[1]).toContain("Model: test/fake");
+    expect(rendered.slice(0, -3).join("\n")).not.toContain(expected);
+    expect(rendered.join("\n")).not.toMatch(/Context:|\bctx\b/);
+    expect(overlay["cachedLines"]!.join("\n")).not.toContain(expected);
+    expect(requestRender).not.toHaveBeenCalled();
+    expect(input).toEqual(original);
+    expect([...clock!.timers.values()].map((timer) => timer.delay)).toEqual([200]);
+  });
+
+  test("context stays in the footer when following long output or scrolling manually", () => {
+    const { overlay } = createSavedOverlay();
+    expect(contextLine(overlay)).toContain(" │ 10%/500k │ ←/→ agent");
+    overlay.handleInput("G");
+    const bottom = overlay.render(80).map(stripVTControlCharacters);
+    expect(bottom.at(-2)).toContain(" │ 10%/500k │ ←/→ agent");
+    expect(bottom.join("\n")).toContain("chat_line_100");
+    expect(bottom.slice(1, -3).join("\n")).not.toContain("Model:");
+    expect(bottom.slice(0, -3).join("\n")).not.toContain("10%/500k");
+    expect(overlay["scrollOffset"]).toBeGreaterThan(0);
+    for (const key of ["k", "j", "g", "G", "\x1b[5~", "\x1b[6~"]) {
+      overlay.handleInput(key);
+      expect(contextLine(overlay)).toContain(" │ 10%/500k │ ←/→ agent");
+    }
+  });
+
+  test.each([false, true])("reads only the known info file about once a second before an unchanged/missing session return (missing=%s)", (missing) => {
+    const { overlay, requestRender, infoFile, writeInfo } = createSavedOverlay();
+    if (missing) fs.unlinkSync(overlay["info"].sessionFile);
+    writeInfo({ contextUsage: { ...savedContextUsage, tokens: 60_000, percent: 12 } });
+    const read = spyOn(fs, "readFileSync");
+    const scan = spyOn(fs, "readdirSync");
+    const connect = spyOn(net, "connect");
+    const poll = [...clock!.timers.values()].find((timer) => timer.delay === 200)!;
+    const reads = () => read.mock.calls.filter(([file]) => file === infoFile).length;
+    try {
+      for (let i = 0; i < 4; i++) { clock!.advance(200); poll.callback(); }
+      expect(reads()).toBe(0);
+      expect(contextLine(overlay)).toContain("10%/500k");
+      clock!.advance(200);
+      poll.callback();
+      expect(reads()).toBe(1);
+      expect(contextLine(overlay)).toContain("12%/500k");
+      expect(requestRender).toHaveBeenCalledTimes(1);
+      for (let i = 0; i < 5; i++) { clock!.advance(200); poll.callback(); }
+      expect(reads()).toBe(2);
+      expect(requestRender).toHaveBeenCalledTimes(1);
+      expect(scan).not.toHaveBeenCalled();
+      expect(connect).not.toHaveBeenCalled();
+      expect([...clock!.timers.values()].map((timer) => timer.delay)).toEqual([200]);
+    } finally {
+      connect.mockRestore();
+      scan.mockRestore();
+      read.mockRestore();
+    }
+  });
+
+  test("temporary read failures keep the last value; successful missing or corrupt fields clear it", () => {
+    const { overlay, requestRender, infoFile, writeInfo } = createSavedOverlay();
+    const poll = () => { clock!.advance(1000); overlay["poll"](); };
+    writeInfo({ contextUsage: { ...savedContextUsage, tokens: 60_000, percent: 12 } });
+    poll();
+    expect(contextLine(overlay)).toContain("12%/500k");
+    const requests = requestRender.mock.calls.length;
+    for (const fail of [() => fs.unlinkSync(infoFile), () => fs.writeFileSync(infoFile, "{incomplete")]) {
+      fail();
+      poll();
+      expect(contextLine(overlay)).toContain("12%/500k");
+      expect(requestRender.mock.calls.length).toBe(requests);
+    }
+    writeInfo({});
+    poll();
+    expect(contextLine(overlay)).toContain("?%/?");
+    expect(overlay["contextUsage"]).toBeUndefined();
+    expect(requestRender.mock.calls.length).toBe(requests + 1);
+    writeInfo({ contextUsage: { tokens: null, percent: null, contextWindow: 500_000 } });
+    poll();
+    expect(contextLine(overlay)).toContain("?%/500k");
+    expect(requestRender.mock.calls.length).toBe(requests + 2);
+    writeInfo({ contextUsage: { tokens: "bad", percent: -1, contextWindow: 500_000 } });
+    poll();
+    expect(contextLine(overlay)).toContain("?%/500k");
+    expect(requestRender.mock.calls.length).toBe(requests + 2);
+    writeInfo({ contextUsage: { tokens: 50_000, percent: 10, contextWindow: "invalid" } });
+    poll();
+    expect(contextLine(overlay)).toContain("?%/?");
+    expect(requestRender.mock.calls.length).toBe(requests + 3);
+    expect(contextLine(overlay)).not.toMatch(/NaN|Infinity/);
+  });
+
+  test.each([
+    [false, false], [false, true], [true, false], [true, true],
+  ])("metadata-only updates preserve native tools, chat cache and scroll (follow=%s, historyDirty=%s)", (follow, dirty) => {
+    const { overlay, requestRender, writeInfo } = createSavedOverlay();
+    const component = start(overlay);
+    progress(overlay);
+    overlay["socket"] = { connecting: false, destroyed: false, destroy() {} } as any;
+    overlay.handleInput(follow ? "G" : "g");
+    overlay.render(82);
+    overlay["historyDirty"] = dirty;
+    const cached = overlay["cachedLines"];
+    const children = [...overlay["chatContainer"].children];
+    const pending = overlay["pendingTools"].get("call-1");
+    const result = component["result"];
+    const offset = overlay["scrollOffset"];
+    const timers = [...clock!.timers];
+    const requests = requestRender.mock.calls.length;
+    const spies = [
+      spyOn(overlay as any, "rebuildChat"), spyOn(overlay as any, "finishToolComponents"),
+      spyOn(overlay["chatContainer"], "render"), spyOn(component, "updateResult"),
+      spyOn(component, "setArgsComplete"), spyOn(component, "markExecutionStarted"),
+    ];
+    try {
+      writeInfo({ contextUsage: { tokens: 60_000, contextWindow: 500_000, percent: 12 }, status: "completed" });
+      clock!.advance(1000);
+      overlay["poll"]();
+      expect(requestRender.mock.calls.length).toBe(requests + 1);
+      expect(contextLine(overlay, 82)).toContain("12%/500k");
+      expect(overlay["cachedLines"]).toBe(cached);
+      expect(overlay["cachedWidth"]).toBe(80);
+      expect(overlay["scrollOffset"]).toBe(offset);
+      expect(overlay["followMode"]).toBe(follow);
+      expect(overlay["historyDirty"]).toBe(dirty);
+      expect(overlay["status"]).toBe("tool");
+      expect(overlay["pendingTools"].get("call-1")).toBe(pending);
+      expect(pending!.executing).toBe(true);
+      expect(component["result"]).toBe(result);
+      expect(overlay["info"].contextUsage).toEqual(savedContextUsage);
+      expect(overlay["chatContainer"].children).toHaveLength(children.length);
+      children.forEach((child, i) => expect(overlay["chatContainer"].children[i]).toBe(child));
+      expect([...clock!.timers]).toEqual(timers);
+      clock!.advance(1000);
+      overlay["poll"]();
+      expect(requestRender.mock.calls.length).toBe(requests + 1);
+      for (const spy of spies) expect(spy).not.toHaveBeenCalled();
+    } finally {
+      for (const spy of spies) spy.mockRestore();
+    }
+  });
+
+  test("streaming with deferred history still refreshes context without replacing the assistant or following again", () => {
+    const { overlay, requestRender, writeInfo } = createSavedOverlay();
+    overlay["socket"] = { connecting: false, destroyed: false, destroy() {} } as any;
+    overlay["handleEvent"]({
+      type: "sync", status: "streaming",
+      partialMessage: assistant([{ type: "text", text: lines("streaming_", 100) }]),
+    });
+    overlay.handleInput("G");
+    overlay.render(80);
+    overlay["historyDirty"] = true;
+    const streaming = overlay["streamingComponent"];
+    const message = overlay["streamingMessage"];
+    const cached = overlay["cachedLines"];
+    const offset = overlay["scrollOffset"];
+    const requests = requestRender.mock.calls.length;
+    const rebuild = spyOn(overlay as any, "rebuildChat");
+    try {
+      writeInfo({ contextUsage: { tokens: 0, contextWindow: 500_000, percent: 0 } });
+      clock!.advance(1000);
+      overlay["poll"]();
+      expect(contextLine(overlay)).toContain("0%/500k");
+      expect(overlay["streamingComponent"]).toBe(streaming);
+      expect(overlay["streamingMessage"]).toBe(message);
+      expect(overlay["cachedLines"]).toBe(cached);
+      expect(overlay["scrollOffset"]).toBe(offset);
+      expect(overlay["followMode"]).toBe(true);
+      expect(overlay["status"]).toBe("streaming");
+      expect(overlay["historyDirty"]).toBe(true);
+      expect(requestRender.mock.calls.length).toBe(requests + 1);
+      expect(rebuild).not.toHaveBeenCalled();
+    } finally {
+      rebuild.mockRestore();
+    }
+  });
+
+  test.each([false, true])("RPC responses do not invalidate chat, alter context or move scrolling (follow=%s)", (follow) => {
+    const { overlay, requestRender } = createSavedOverlay();
+    const component = start(overlay);
+    progress(overlay);
+    overlay.handleInput(follow ? "G" : "g");
+    overlay.render(80);
+    const cached = overlay["cachedLines"];
+    const offset = overlay["scrollOffset"];
+    const pending = overlay["pendingTools"].get("call-1");
+    const result = component["result"];
+    const timers = [...clock!.timers];
+    const requests = requestRender.mock.calls.length;
+    const invalidate = spyOn(overlay as any, "invalidateCache");
+    try {
+      for (const success of [true, false]) for (const command of ["get_session_stats", "get_state", "abort"]) {
+        overlay["handleEvent"]({
+          type: "response", id: "management-rpc", command, success,
+          data: { contextUsage: { tokens: 100_000, contextWindow: 500_000, percent: 20 } },
+        });
+      }
+      expect(invalidate).not.toHaveBeenCalled();
+      expect(requestRender.mock.calls.length).toBe(requests);
+      expect(overlay["cachedLines"]).toBe(cached);
+      expect(overlay["scrollOffset"]).toBe(offset);
+      expect(overlay["followMode"]).toBe(follow);
+      expect(overlay["status"]).toBe("tool");
+      expect(overlay["pendingTools"].get("call-1")).toBe(pending);
+      expect(component["result"]).toBe(result);
+      expect(contextLine(overlay)).toContain("10%/500k");
+      expect([...clock!.timers]).toEqual(timers);
+    } finally {
+      invalidate.mockRestore();
+    }
+  });
+
+  test("the footer is themed on every render, not stored with ANSI in the chat cache", () => {
+    const { overlay } = createSavedOverlay();
+    let color = 31;
+    const fg = spyOn(overlay["theme"], "fg").mockImplementation((_name, text) => `\x1b[${color}m${text}\x1b[0m`);
+    try {
+      const first = overlay.render(80).at(-2)!;
+      const cached = overlay["cachedLines"];
+      expect(first).toContain("\x1b[31m ");
+      expect(first).toContain(" │ 10%/500k │ ←/→ agent");
+      color = 32;
+      const second = overlay.render(80).at(-2)!;
+      expect(second).toContain("\x1b[32m ");
+      expect(second).toContain(" │ 10%/500k │ ←/→ agent");
+      expect(second).not.toContain("\x1b[31m");
+      expect(overlay["cachedLines"]).toBe(cached);
+      expect(cached!.join("\n")).not.toContain("10%/500k");
+      overlay.invalidate();
+      expect(overlay["cachedLines"]).toBeNull();
+      const resized = overlay.render(38).at(-2)!;
+      expect(resized).toContain("\x1b[32m ");
+      expect(resized).toContain(" │ 10%/500k");
+    } finally {
+      fg.mockRestore();
+    }
+  });
+
+  test("all widths fit ANSI/wide names and preserve maxHeight - 4 transcript rows", () => {
+    const { overlay, tui } = createSavedOverlay();
+    overlay["info"].taskName = "中文长名称😀/".repeat(40);
+    (overlay as any).modelName = "中文模型😀".repeat(20);
+    start(overlay);
+    progress(overlay);
+    overlay["status"] = "streaming";
+    const fg = spyOn(overlay["theme"], "fg").mockImplementation((_name, text) => `\x1b[36m${text}\x1b[0m`);
+    try {
+      for (const rows of [0, 8, 11, 12, 13, 35, 64, 90]) {
+        (tui.terminal as any).rows = rows;
+        for (const width of [0, 1, 2, 3, 4, 8, 12, 21, 22, 32, 38, 50, 80, 120]) {
+          overlay.handleInput("G");
+          const rendered = overlay.render(width);
+          for (const line of rendered) expect(visibleWidth(line)).toBeLessThanOrEqual(width);
+          if (width < 3) continue;
+          const maxHeight = Math.min(60, Math.max(8, rows - 4));
+          expect(rendered).toHaveLength(maxHeight);
+          expect(overlay["scrollOffset"]).toBe(Math.max(0, overlay["cachedLines"]!.length - (maxHeight - 4)));
+          for (const line of rendered) expect(visibleWidth(line)).toBe(width);
+          const plain = rendered.map(stripVTControlCharacters);
+          expect(plain[0]).toStartWith("╭");
+          expect(plain[0]).toEndWith("╮");
+          expect(plain.at(-1)).toStartWith("╰");
+          expect(plain.at(-1)).toEndWith("╯");
+          expect(plain.join("\n")).not.toMatch(/Context:|\bctx\b/);
+          expect(plain.slice(0, -3).join("\n")).not.toContain("10%/500k");
+          if (width >= 32) {
+            expect(plain.at(-2)).toContain(" │ 10%/500k");
+            expect(plain[0]).toContain("● streaming");
+          }
+          if (width >= 50) expect(plain.at(-2)).toContain(" │ 10%/500k │ ←/→ agent");
+        }
+      }
+    } finally {
+      fg.mockRestore();
+    }
+  });
+
+  test("socket close reads immediately and the existing poll can pick up a later final snapshot", () => {
+    const { overlay, requestRender, writeInfo, infoFile } = createSavedOverlay();
+    const socket = Object.assign(new EventEmitter(), { destroy: mock(() => {}) });
+    const connect = spyOn(net, "connect").mockReturnValue(socket as any);
+    const read = spyOn(fs, "readFileSync");
+    try {
+      overlay["connectSocket"]();
+      const close = socket.listeners("close")[0] as () => void;
+      const data = socket.listeners("data")[0] as (data: Buffer) => void;
+      const error = socket.listeners("error")[0] as () => void;
+      writeInfo({ contextUsage: { tokens: 60_000, contextWindow: 500_000, percent: 12 } });
+      close();
+      expect(overlay["socket"]).toBeNull();
+      expect(contextLine(overlay)).toContain("12%/500k");
+      expect(read.mock.calls.filter(([file]) => file === infoFile)).toHaveLength(1);
+      writeInfo({ contextUsage: { tokens: 70_000, contextWindow: 500_000, percent: 14 } });
+      overlay["poll"]();
+      expect(contextLine(overlay)).toContain("12%/500k");
+      clock!.advance(1000);
+      overlay["poll"]();
+      expect(contextLine(overlay)).toContain("14%/500k");
+      expect(read.mock.calls.filter(([file]) => file === infoFile)).toHaveLength(2);
+      const queuedPoll = [...clock!.timers.values()].find((timer) => timer.delay === 200)!;
+      overlay.dispose();
+      const requests = requestRender.mock.calls.length;
+      const usage = overlay["contextUsage"];
+      clock!.advance(1000);
+      close();
+      data(Buffer.from(JSON.stringify({ type: "message_start", message: assistant() }) + "\n"));
+      error();
+      queuedPoll.callback();
+      expect(overlay["refreshContextUsage"]()).toBe(false);
+      expect(overlay["contextUsage"]).toBe(usage);
+      expect(read.mock.calls.filter(([file]) => file === infoFile)).toHaveLength(2);
+      expect(requestRender.mock.calls.length).toBe(requests);
+      expect(clock!.timers.size).toBe(0);
+    } finally {
+      read.mockRestore();
+      connect.mockRestore();
+    }
+  });
+
+  test("disposal during a metadata read discards the result and stops the rest of the poll", () => {
+    const { overlay, requestRender, writeInfo, infoFile } = createSavedOverlay();
+    writeInfo({ contextUsage: { tokens: 60_000, contextWindow: 500_000, percent: 12 } });
+    const original = fs.readFileSync;
+    const read = spyOn(fs, "readFileSync").mockImplementation(((file: any, ...args: any[]) => {
+      const result = (original as any)(file, ...args);
+      if (file === infoFile) overlay.dispose();
+      return result;
+    }) as any);
+    const stat = spyOn(fs, "statSync");
+    try {
+      clock!.advance(1000);
+      overlay["poll"]();
+      expect(overlay["disposed"]).toBe(true);
+      expect(overlay["contextUsage"]).toEqual(savedContextUsage);
+      expect(requestRender).not.toHaveBeenCalled();
+      expect(stat).not.toHaveBeenCalled();
+      expect(clock!.timers.size).toBe(0);
+    } finally {
+      stat.mockRestore();
+      read.mockRestore();
+    }
+  });
+
+  test("constructor failure before resource startup leaves no poll or socket", () => {
+    const rebuild = spyOn(SubagentPeekOverlay.prototype as any, "rebuildChat").mockImplementation(() => {
+      throw new Error("failed to construct chat");
+    });
+    const connect = spyOn(net, "connect");
+    try {
+      expect(() => createOverlay()).toThrow("failed to construct chat");
+      expect(connect).not.toHaveBeenCalled();
+      expect(clock!.timers.size).toBe(0);
+      expect(clock!.set).not.toHaveBeenCalled();
+    } finally {
+      connect.mockRestore();
+      rebuild.mockRestore();
+    }
+  });
+
+  test.each(["regular", "fullscreen"] as const)("%s TUI keeps context visible across metadata updates, resize and navigation", (mode) => {
+    let input = (_data: string) => {};
+    let resize = () => {};
+    const writes: string[] = [];
+    const terminal: Terminal & { columns: number; rows: number } = {
+      columns: 100, rows: 35, kittyProtocolActive: false,
+      start(onInput, onResize) { input = onInput; resize = onResize; },
+      stop() {}, async drainInput() {}, write(data) { writes.push(data); },
+      moveBy() {}, hideCursor() {}, showCursor() {}, clearLine() {}, clearFromCursor() {},
+      clearScreen() {}, setTitle() {}, setProgress() {}, setProgramStatus() {},
+    };
+    const tui = mode === "regular" ? new TuiMainScreen(terminal) : new TuiAltScreen(terminal);
+    const { overlay, writeInfo, done } = createSavedOverlay(savedContextUsage, () => tui);
+    const handle = tui.showOverlay(overlay, { anchor: "right-center", width: "100%", maxHeight: 60 });
+    const draw = () => {
+      writes.length = 0;
+      tui.renderNow(true);
+      return stripVTControlCharacters(writes.join(""));
+    };
+    tui.start();
+    try {
+      input("G");
+      expect(draw()).toContain(" │ 10%/500k │ ←/→ agent");
+      writeInfo({ contextUsage: { tokens: 60_000, contextWindow: 500_000, percent: 12 } });
+      clock!.advance(1000);
+      overlay["poll"]();
+      expect(draw()).toContain(" │ 12%/500k │ ←/→ agent");
+      for (const columns of [32, 38, 50, 80, 120]) {
+        terminal.columns = columns;
+        terminal.rows = 12;
+        resize();
+        expect(draw()).toContain(" │ 12%/500k");
+      }
+      input("\r"); // Enter must not expand tools or close the existing interaction.
+      expect(done).not.toHaveBeenCalled();
+      input("\x1b[C");
+      expect(done).toHaveBeenCalledWith("next");
+      expect(overlay["disposed"]).toBe(true);
+    } finally {
+      overlay.dispose();
+      handle.hide();
+      tui.stop();
+    }
+    expect(clock!.timers.size).toBe(0);
   });
 });
 
@@ -904,7 +1359,7 @@ describe("overlay creation paths and native lifecycle", () => {
   });
 
   test.each([
-    ["dispose", undefined, undefined], ["close", "q", undefined],
+    ["dispose", undefined, undefined], ["close", "q", undefined], ["escape", "\x1b", undefined],
     ["previous agent", "\x1b[D", "previous"], ["next agent", "\x1b[C", "next"],
   ])("%s releases timers; repeat disposal and late events, polls and renderer callbacks are inert", (_name, key, navigation) => {
     const { overlay, requestRender, done } = createOverlay();

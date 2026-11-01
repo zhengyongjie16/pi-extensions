@@ -42,6 +42,9 @@ const {
   RpcJsonlDecoder,
   consumeFirstMatchingMailboxEvent,
   formatAgentError,
+  formatContextUsage,
+  normalizeContextUsage,
+  readInfoFile,
   getAgent,
   getAgentDefinitionsDescription,
   getRunsDir,
@@ -505,7 +508,8 @@ describe("child model validation", () => {
       const info = manager.getAgentInfo("worker", parentSessionId);
       expect(info).toMatchObject({ provider: "fireworks", modelId, model: `fireworks:${modelId}`, status: "running" });
       const records = fs.readFileSync(info.sessionFile, "utf8").trim().split("\n").map((line) => JSON.parse(line));
-      expect(records.map((entry) => entry.type)).toEqual(["started", "get_state", "get_available_models", "prompt"]);
+      expect(records.filter((entry) => entry.type !== "get_session_stats").map((entry) => entry.type))
+        .toEqual(["started", "get_state", "get_available_models", "prompt"]);
     } finally {
       await manager.shutdown();
       fs.rmSync(templateFile, { force: true });
@@ -1367,9 +1371,13 @@ describe("extension completion delivery and TUI", () => {
         async custom(create: any) {
           const theme = { fg: (_color: string, text: string) => text, bold: (text: string) => text };
           const menu = create({ requestRender() {} }, theme, {}, () => {});
-          expect(menu.render(80).join("\n")).toContain("Subagents");
-          menusOpened++;
-          return undefined;
+          try {
+            expect(menu.render(80).join("\n")).toContain("Subagents");
+            menusOpened++;
+            return undefined;
+          } finally {
+            menu.dispose?.();
+          }
         },
       },
     };
@@ -1394,6 +1402,400 @@ describe("extension completion delivery and TUI", () => {
       await shutdown?.();
       fs.rmSync(configFile, { force: true });
     }
+  });
+
+  describe("agent browser", () => {
+    async function withBrowser(run: (fixture: any) => Promise<void>) {
+      const parentId = `browser-${randomUUID()}`;
+      const otherId = `other-${randomUUID()}`;
+      const scopes = new Set<string>();
+      const records = new Map<string, AgentInfo>();
+      let sequence = 0;
+      const put = (name: string, overrides: Partial<AgentInfo> = {}, parent = parentId) => {
+        const scope = path.join(getRunsDir(), parentScopeKey(parent));
+        scopes.add(scope);
+        fs.mkdirSync(scope, { recursive: true });
+        const previous = records.get(`${parent}/${name}`);
+        const id = previous?.id ?? randomUUID();
+        const now = Date.now() + sequence++;
+        const info: AgentInfo = {
+          id, taskName: name, canonicalName: `/${name}`, parentSessionId: parent,
+          status: "completed", cwd: TEST_AGENT_DIR, provider: "test", modelId: "fake", thinking: "off",
+          createdAt: now, updatedAt: now, messageCount: 0,
+          infoFile: path.join(scope, `${id}.info.json`),
+          sessionFile: path.join(scope, `${id}.jsonl`), logFile: path.join(scope, `${id}.log`),
+          ...previous, ...overrides,
+        };
+        records.set(`${parent}/${name}`, info);
+        fs.writeFileSync(info.infoFile, JSON.stringify(info));
+        return info;
+      };
+      const commands = new Map<string, any>();
+      let shutdown: (() => Promise<void>) | undefined;
+      const { default: subagentExtension } = await import("./index.js");
+
+      const originalList = AgentManager.prototype.listAgents;
+      const originalInfo = AgentManager.prototype.getAgentInfo;
+      const originalConnect = (SubagentPeekOverlay.prototype as any).connectSocket;
+      const list = mock(function(this: AgentManager, ...args: Parameters<AgentManager["listAgents"]>) {
+        return originalList.apply(this, args);
+      });
+      AgentManager.prototype.listAgents = list;
+      (SubagentPeekOverlay.prototype as any).connectSocket = () => {};
+      const requestRender = mock(() => {});
+      const selections: any[] = [];
+      const opened: AgentInfo[] = [];
+      const notify = mock((_message: string, _level?: string) => {});
+      const theme = {
+        ansi: "",
+        fg(_color: string, text: string) { return this.ansi ? `${this.ansi}${text}\x1b[0m` : text; },
+        bold: (text: string) => text,
+      };
+      const ctx: any = { mode: "tui", sessionManager: { getSessionId: () => parentId }, ui: { notify } };
+      const fixture = {
+        parentId, otherId, put, list, selections, opened, ctx, theme, requestRender, notify,
+        tui: { terminal: { rows: 40 }, requestRender } as any,
+        remove(info: AgentInfo) { fs.rmSync(info.infoFile, { force: true }); },
+        command: () => commands.get("subagents").handler("", ctx),
+        async open(interact: (browser: any) => any, overlay?: (component: any, index: number) => any) {
+          ctx.ui.custom = async (create: any) => {
+            let component: any;
+            let result: any;
+            const done = (value: any) => {
+              result = value;
+              if (!(component instanceof SubagentPeekOverlay)) selections.push(value);
+              component?.dispose?.();
+            };
+            component = create(fixture.tui, theme, {}, done);
+            try {
+              if (component instanceof SubagentPeekOverlay) {
+                opened.push(component["info"]);
+                await overlay?.(component, opened.length - 1);
+              } else {
+                await interact(component);
+              }
+              return result;
+            } finally {
+              component.dispose?.();
+            }
+          };
+          await fixture.command();
+        },
+      };
+      try {
+        await subagentExtension({
+          on(name: string, handler: any) { if (name === "session_shutdown") shutdown = handler; },
+          registerTool() {}, registerMessageRenderer() {},
+          registerCommand(name: string, command: any) { commands.set(name, command); },
+          registerShortcut() {},
+          getSettings: () => ({ terminal: { showImages: false }, outputPad: 0 }),
+        } as any);
+        await run(fixture);
+      } finally {
+        await shutdown?.();
+        AgentManager.prototype.listAgents = originalList;
+        AgentManager.prototype.getAgentInfo = originalInfo;
+        (SubagentPeekOverlay.prototype as any).connectSocket = originalConnect;
+        for (const scope of scopes) fs.rmSync(scope, { recursive: true, force: true });
+      }
+    }
+
+    const selectedRow = (browser: any, width = 120) =>
+      stripVTControlCharacters(browser.render(width).find((line: string) => stripVTControlCharacters(line).startsWith("› ")) ?? "");
+
+    test("shows task previews only when present, without context or new timers", async () => {
+      const originalSet = globalThis.setInterval;
+      const interval = mock(() => { throw new Error("The browser must not create an interval"); });
+      globalThis.setInterval = interval as any;
+      try {
+        await withBrowser(async (f) => {
+          f.put("review", { createdAt: 300, lastTaskMessage: "中文任务 \n preview", contextUsage: { tokens: 50000, contextWindow: 500000, percent: 10 } });
+          f.put("plain", { createdAt: 200 });
+          f.put("empty", { createdAt: 100, lastTaskMessage: "" });
+          await f.open((browser: any) => {
+            const lines = browser.render(120);
+            const review = lines.findIndex((line: string) => line.includes("/review"));
+            const plain = lines.findIndex((line: string) => line.includes("/plain"));
+            const empty = lines.findIndex((line: string) => line.includes("/empty"));
+            expect(lines[review + 1]).toBe("  中文任务 preview");
+            expect(plain).toBe(review + 2);
+            expect(empty).toBe(plain + 1);
+            expect(lines[empty + 1]).toBe("");
+            expect(lines.join("\n")).not.toContain("ctx");
+            expect(lines.join("\n")).not.toContain("10%/500k");
+            browser.handleInput("q");
+          });
+        });
+        expect(interval).not.toHaveBeenCalled();
+      } finally {
+        globalThis.setInterval = originalSet;
+      }
+    });
+
+    test("refreshes saved metadata and previews with r", async () => {
+      await withBrowser(async (f) => {
+        f.put("live", { status: "running", lastTaskMessage: "initial preview" });
+        await f.open((browser: any) => {
+          const first = browser.render(80);
+          f.put("live", { status: "completed", lastTaskMessage: "updated preview" });
+          expect(browser.render(80)).toBe(first);
+          const reads = f.list.mock.calls.length;
+          browser.handleInput("r");
+          expect(f.requestRender).toHaveBeenCalledTimes(1);
+          expect(f.list).toHaveBeenCalledTimes(reads);
+          const refreshed = browser.render(80).join("\n");
+          expect(refreshed).toContain("completed");
+          expect(refreshed).toContain("updated preview");
+          expect(refreshed).not.toContain("initial preview");
+          browser.handleInput("q");
+        });
+      });
+    });
+
+    test("navigates pages and clamps selection after deletion or an empty list", async () => {
+      await withBrowser(async (f) => {
+        const history = Array.from({ length: 12 }, (_, index) => f.put(`history/${index}`, { createdAt: 100 - index }));
+        await f.open((browser: any) => {
+          expect(browser.render(120).join("\n")).toContain("↓ 2 more");
+          for (let index = 0; index < 11; index++) {
+            browser.handleInput(index % 2 ? "j" : "\x1b[B");
+            browser.render(120);
+          }
+          expect(selectedRow(browser)).toContain("/history/11");
+          expect(browser.render(120).join("\n")).toContain("↑ 2 more");
+          browser.handleInput("\x1b[A");
+          expect(selectedRow(browser)).toContain("/history/10");
+          browser.handleInput("k");
+          expect(selectedRow(browser)).toContain("/history/9");
+          browser.handleInput("j");
+          browser.render(120);
+          browser.handleInput("j");
+          browser.render(120);
+          f.remove(history[11]);
+          f.remove(history[10]);
+          browser.handleInput("r");
+          expect(selectedRow(browser)).toContain("/history/9");
+          for (const info of history) f.remove(info);
+          browser.handleInput("r");
+          expect(browser.render(80).join("\n")).toContain("No subagents for this session");
+          for (const key of ["j", "k", "\x1b[A", "\x1b[B", "\r"]) browser.handleInput(key);
+          expect(f.selections).toEqual([]);
+          f.put("returned");
+          browser.handleInput("r");
+          expect(selectedRow(browser)).toContain("/returned");
+          browser.handleInput("\r");
+        });
+        expect(f.opened.map((info: AgentInfo) => info.canonicalName)).toEqual(["/returned"]);
+      });
+    });
+
+    test.each(["unrefreshed", "r pending", "scope pending", "selection pending"])("Enter uses the displayed item after insertion (%s)", async (refresh) => {
+      await withBrowser(async (f) => {
+        f.put("first", { createdAt: 200 });
+        f.put("target", { createdAt: 100 });
+        await f.open((browser: any) => {
+          browser.render(120);
+          browser.handleInput("j");
+          expect(selectedRow(browser)).toContain("/target");
+          f.put("inserted", { createdAt: 300 });
+          if (refresh === "r pending") browser.handleInput("r");
+          if (refresh === "scope pending") browser.handleInput("\t");
+          if (refresh === "selection pending") browser.handleInput("k");
+          const reads = f.list.mock.calls.length;
+          browser.handleInput("\r");
+          expect(f.list).toHaveBeenCalledTimes(reads);
+        });
+        expect(f.selections).toEqual([{ task: "/target", parentSessionId: f.parentId, includeAll: false }]);
+        expect(f.opened[0].canonicalName).toBe("/target");
+      });
+    });
+
+    test("skips a record lost between list and detail reads, then safely selects a survivor", async () => {
+      await withBrowser(async (f) => {
+        const gone = f.put("gone", { createdAt: 200 });
+        f.put("survivor", { createdAt: 100 });
+        const getInfo = AgentManager.prototype.getAgentInfo;
+        AgentManager.prototype.getAgentInfo = function(target, parent) {
+          if (target === "/gone") f.remove(gone);
+          return getInfo.call(this, target, parent);
+        };
+        await f.open((browser: any) => {
+          expect(() => browser.render(80)).not.toThrow();
+          expect(browser.render(80).join("\n")).not.toContain("/gone");
+          browser.handleInput("\r");
+          expect(f.selections).toEqual([]);
+          browser.handleInput("r");
+          expect(selectedRow(browser)).toContain("/survivor");
+          browser.handleInput("\r");
+        });
+        expect(f.opened[0].canonicalName).toBe("/survivor");
+      });
+    });
+
+    test("does not open a different agent when the displayed Enter target disappears", async () => {
+      await withBrowser(async (f) => {
+        const gone = f.put("gone", { createdAt: 200 });
+        f.put("survivor", { createdAt: 100 });
+        await f.open((browser: any) => {
+          browser.render(80);
+          f.remove(gone);
+          browser.handleInput("\r");
+        });
+        expect(f.selections[0].task).toBe("/gone");
+        expect(f.opened).toEqual([]);
+        expect(f.notify).toHaveBeenCalledWith(expect.stringContaining("Agent not found"), "error");
+      });
+    });
+
+    test.each([["\x1b[D", "previous"], ["\x1b[C", "next"]])("handles a disappearing %s overlay navigation target", async (key, direction) => {
+      await withBrowser(async (f) => {
+        const previous = f.put("previous", { createdAt: 300 });
+        f.put("middle", { createdAt: 200 });
+        const next = f.put("next", { createdAt: 100 });
+        const list = AgentManager.prototype.listAgents;
+        let navigating = false;
+        AgentManager.prototype.listAgents = function(...args) {
+          const entries = list.apply(this, args);
+          if (navigating) f.remove(direction === "next" ? next : previous);
+          return entries;
+        };
+        await f.open((browser: any) => {
+          browser.render(120);
+          browser.handleInput("j");
+          expect(selectedRow(browser)).toContain("/middle");
+          browser.handleInput("\r");
+        }, (overlay: any) => {
+          navigating = true;
+          overlay.handleInput(key);
+        });
+        expect(f.opened.map((info: AgentInfo) => info.canonicalName)).toEqual(["/middle"]);
+        expect(f.notify).toHaveBeenCalledWith(expect.stringContaining("Agent not found"), "error");
+      });
+    });
+
+    test("all-session browsing distinguishes identical names and remains read-only", async () => {
+      await withBrowser(async (f) => {
+        const own = f.put("same", { modelId: "own-model" });
+        const other = f.put("same", { modelId: "other-model" }, f.otherId);
+        const before = [own, other].map((info) => fs.readFileSync(info.infoFile, "utf8"));
+        const controlNames = ["spawnAgent", "sendMessage", "interruptAgent", "sendCommand"] as const;
+        const originals = controlNames.map((name) => (AgentManager.prototype as any)[name]);
+        const controls = controlNames.map((name) => {
+          const control = mock(() => { throw new Error(`Browser must not call ${name}`); });
+          (AgentManager.prototype as any)[name] = control;
+          return control;
+        });
+        try {
+          await f.open((browser: any) => {
+            expect(browser.render(120).join("\n")).not.toContain("other-model");
+            browser.handleInput("\t");
+            const lines = browser.render(120).join("\n");
+            expect(lines).toContain("own-model");
+            expect(lines).toContain("other-model");
+            expect(selectedRow(browser)).toEndWith(f.otherId.slice(-8));
+            browser.handleInput("j");
+            expect(selectedRow(browser)).toEndWith(f.parentId.slice(-8));
+            browser.handleInput("\t");
+            expect(selectedRow(browser)).toContain("/same");
+            browser.handleInput("\t");
+            expect(selectedRow(browser)).toEndWith(f.otherId.slice(-8));
+            browser.handleInput("\r");
+          }, (overlay: any, index: number) => overlay.handleInput(["\x1b[C", "\x1b[D", "q"][index]));
+          expect(f.selections).toEqual([{ task: "/same", parentSessionId: f.otherId, includeAll: true }]);
+          expect(f.opened.map((info: AgentInfo) => info.parentSessionId)).toEqual([f.otherId, f.parentId, f.otherId]);
+          for (const control of controls) expect(control).not.toHaveBeenCalled();
+          expect([own, other].map((info) => fs.readFileSync(info.infoFile, "utf8"))).toEqual(before);
+        } finally {
+          controlNames.forEach((name, index) => { (AgentManager.prototype as any)[name] = originals[index]; });
+        }
+      });
+    });
+
+    test("clips wide ANSI previews at 32/38/50/80/120 columns and invalidates theme caches", async () => {
+      await withBrowser(async (f) => {
+        const info = f.put("wide", {
+          canonicalName: "/中文很长的名称".repeat(6), modelId: "宽模型".repeat(10),
+          lastTaskMessage: "\x1b[31m中文任务 😀\tcombining é ".repeat(20) + "\x1b[0m",
+        });
+        // Task creation restricts names to ASCII; exercise rendering of wide historical labels directly.
+        const getInfo = AgentManager.prototype.getAgentInfo;
+        AgentManager.prototype.getAgentInfo = function(target, parent) {
+          return target === info.canonicalName ? info : getInfo.call(this, target, parent);
+        };
+        f.theme.ansi = "\x1b[36m";
+        await f.open((browser: any) => {
+          for (const width of [32, 38, 50, 80, 120]) {
+            const lines = browser.render(width);
+            expect(lines.every((line: string) => visibleWidth(line) <= width)).toBe(true);
+            const preview = lines.map(stripVTControlCharacters).find((line: string) => line.startsWith("  中文任务"));
+            expect(preview).toStartWith("  中文任务 😀");
+            expect(lines.join("\n")).not.toContain("\t");
+          }
+          const first = browser.render(120);
+          expect(first.join("\n")).toContain("\x1b[36m");
+          f.theme.ansi = "\x1b[35m";
+          browser.invalidate();
+          const themed = browser.render(120).join("\n");
+          expect(themed).toContain("\x1b[35m");
+          expect(themed).not.toContain("\x1b[36m");
+          browser.handleInput("q");
+        });
+      });
+    });
+
+    test.each(["regular", "fullscreen"] as const)("native %s TUI list supports manual refresh and resize", async (mode) => {
+      await withBrowser(async (f) => {
+        f.put("native", { lastTaskMessage: "中文任务 ".repeat(30) });
+        let input: (data: string) => void = () => {};
+        let resize = () => {};
+        const writes: string[] = [];
+        const terminal: Terminal & { columns: number; rows: number } = {
+          columns: 120, rows: 35, kittyProtocolActive: false,
+          start(onInput, onResize) { input = onInput; resize = onResize; },
+          stop() {}, async drainInput() {}, write(data) { writes.push(data); },
+          moveBy() {}, hideCursor() {}, showCursor() {}, clearLine() {}, clearFromCursor() {},
+          clearScreen() {}, setTitle() {}, setProgress() {}, setProgramStatus() {},
+        };
+        const tui = mode === "regular" ? new TuiMainScreen(terminal) : new TuiAltScreen(terminal);
+        f.tui = tui;
+        await f.open((browser: any) => {
+          tui.addChild(browser);
+          tui.setFocus(browser);
+          tui.start();
+          const draw = () => {
+            writes.length = 0;
+            tui.renderNow(true);
+            return stripVTControlCharacters(writes.join(""));
+          };
+          try {
+            expect(draw()).toContain("中文任务");
+            f.put("native", { lastTaskMessage: "updated preview" });
+            input("r");
+            expect(draw()).toContain("updated preview");
+            for (const width of [32, 38, 50, 80, 120]) {
+              terminal.columns = width;
+              resize();
+              expect(draw()).toContain("updated preview");
+              expect(browser.render(width).every((line: string) => visibleWidth(line) <= width)).toBe(true);
+            }
+            input("\x1b");
+            expect(f.selections).toEqual([undefined]);
+          } finally {
+            tui.stop();
+          }
+        });
+      });
+    });
+
+    test("does not construct a browser outside TUI mode", async () => {
+      await withBrowser(async (f) => {
+        f.ctx.mode = "rpc";
+        f.ctx.ui.custom = mock(() => { throw new Error("custom is unavailable"); });
+        await f.command();
+        expect(f.ctx.ui.custom).not.toHaveBeenCalled();
+        expect(f.notify).toHaveBeenCalledWith(expect.stringContaining("interactive TUI"), "warning");
+      });
+    });
   });
 
   test("registers commands, renders one-line activity, and delivers bounded completions", async () => {
@@ -1492,36 +1894,39 @@ describe("extension completion delivery and TUI", () => {
           updatedAt: historyCreatedAt - index,
         }));
       }
-      let browser: any;
       ctx.ui.custom = async (create: any) => {
-        browser = create({ requestRender() {} }, {
+        const browser = create({ requestRender() {} }, {
           fg: (_color: string, text: string) => text,
           bold: (text: string) => text,
         }, {}, () => {});
-        return undefined;
+        try {
+          const browserLines = browser.render(120);
+          const firstRowIndex = browserLines.findIndex((line: string) => line.includes("/history/0"));
+          const firstRow = browserLines[firstRowIndex];
+          expect(firstRow).toMatch(/\/history\/0\s+running\s+\S+\s+MiniMax-M3\s+high/);
+          expect(browserLines[firstRowIndex + 1]).toContain("private task context 0");
+          const secondRow = browserLines.find((line: string) => line.includes("/history/1 "));
+          expect(secondRow.indexOf("a-model-name")).toBe(firstRow.indexOf("MiniMax-M3"));
+          expect(visibleWidth(secondRow.slice(0, secondRow.indexOf("medium"))))
+            .toBe(visibleWidth(firstRow.slice(0, firstRow.indexOf("high"))));
+          expect(secondRow).not.toContain("a-model-name-that-is-longer-than-the-column");
+          for (const width of [80, 50, 32]) {
+            expect(browser.render(width).every((line: string) => visibleWidth(line) <= width)).toBe(true);
+          }
+          const narrowRow = browser.render(50).find((line: string) => line.includes("/history/0"));
+          expect(narrowRow).toContain("high");
+          expect(narrowRow).not.toContain("MiniMax-M3");
+          browser.handleInput("\t");
+          const allSessionRow = browser.render(80).find((line: string) => line.includes("/history/0"));
+          expect(allSessionRow).toContain("MiniMax-M3");
+          expect(allSessionRow).toContain("high");
+          expect(allSessionRow.trimEnd()).toEndWith(parentSessionId.slice(-8));
+          return undefined;
+        } finally {
+          browser.dispose?.();
+        }
       };
       await commands.get("subagents").handler("", ctx);
-      const browserLines = browser.render(120);
-      const firstRowIndex = browserLines.findIndex((line: string) => line.includes("/history/0"));
-      const firstRow = browserLines[firstRowIndex];
-      expect(firstRow).toMatch(/\/history\/0\s+running\s+\S+\s+MiniMax-M3\s+high/);
-      expect(browserLines[firstRowIndex + 1]).toContain("private task context 0");
-      const secondRow = browserLines.find((line: string) => line.includes("/history/1 "));
-      expect(secondRow.indexOf("a-model-name")).toBe(firstRow.indexOf("MiniMax-M3"));
-      expect(visibleWidth(secondRow.slice(0, secondRow.indexOf("medium"))))
-        .toBe(visibleWidth(firstRow.slice(0, firstRow.indexOf("high"))));
-      expect(secondRow).not.toContain("a-model-name-that-is-longer-than-the-column");
-      for (const width of [80, 50, 32]) {
-        expect(browser.render(width).every((line: string) => visibleWidth(line) <= width)).toBe(true);
-      }
-      const narrowRow = browser.render(50).find((line: string) => line.includes("/history/0"));
-      expect(narrowRow).toContain("high");
-      expect(narrowRow).not.toContain("MiniMax-M3");
-      browser.handleInput("\t");
-      const allSessionRow = browser.render(80).find((line: string) => line.includes("/history/0"));
-      expect(allSessionRow).toContain("MiniMax-M3");
-      expect(allSessionRow).toContain("high");
-      expect(allSessionRow.trimEnd()).toEndWith(parentSessionId.slice(-8));
 
       const firstAgentPage = await tools.get("list_agents").execute("list-1", {}, undefined, undefined, ctx);
       const firstAgentPayload = JSON.parse(firstAgentPage.content[0].text);
@@ -2259,4 +2664,760 @@ describe("observer broadcast", () => {
       .filter((message) => message.role === "toolResult").map((message: any) => message.toolCallId))
       .toEqual(["script", "direct/read"]);
   });
+});
+
+describe("context usage formatting", () => {
+  test.each([
+    [50000, 500000, 10, "10%/500k"],
+    [60000, 500000, 12, "12%/500k"],
+    [1, 500000, 10.44, "10.4%/500k"],
+    [0, 500000, 0, "0%/500k"],
+    [1, 500000, 0.0002, "<0.1%/500k"],
+    [500, 500000, 0.1, "0.1%/500k"],
+    [525000, 500000, 105, "105%/500k"],
+    [null, 500000, null, "?%/500k"],
+    [105000, 1050000, 10, "10%/1.05M"],
+    [100000, 1000000, 10, "10%/1M"],
+    [1, 1000, 1, "1%/1k"],
+    [1, 999, 1, "1%/999"],
+  ])("formats native values %s/%s (%s)", (tokens, contextWindow, percent, expected) => {
+    expect(formatContextUsage({ tokens, contextWindow, percent })).toBe(expected);
+  });
+
+  test.each([undefined, null, false, 0, [], {}, { contextWindow: 0 }, { contextWindow: -1 },
+    { contextWindow: NaN }, { contextWindow: Infinity }, { contextWindow: "500000" },
+  ].map((value) => ({ value })))("rejects an unknown or invalid context window %#", ({ value }) => {
+    expect(normalizeContextUsage(value)).toBeUndefined();
+    expect(formatContextUsage(value)).toBe("?%/?");
+  });
+
+  test.each([
+    {}, { tokens: 0 }, { percent: 0 }, { tokens: null, percent: 0 }, { tokens: 1, percent: null },
+    { tokens: -1, percent: 10 }, { tokens: 1, percent: -10 }, { tokens: NaN, percent: 10 },
+    { tokens: 1, percent: Infinity }, { tokens: "1", percent: "10" },
+  ])("normalizes an incomplete or invalid usage pair to unknown %#", (value) => {
+    const input = { contextWindow: 500000, ...value };
+    expect(normalizeContextUsage(input)).toEqual({ contextWindow: 500000, tokens: null, percent: null });
+    expect(formatContextUsage(input)).toBe("?%/500k");
+  });
+
+  test("validates disk snapshots without migrating legacy history", () => {
+    const directory = fs.mkdtempSync(path.join(TEST_AGENT_DIR, "context-read-"));
+    const file = path.join(directory, "agent.info.json");
+    try {
+      for (const value of [
+        { status: "completed" },
+        { status: "completed", contextUsage: { contextWindow: 0, tokens: 0, percent: 0 } },
+        { status: "completed", contextUsage: "bad metadata" },
+      ]) {
+        fs.writeFileSync(file, JSON.stringify(value));
+        expect(readInfoFile(file)?.contextUsage).toBeUndefined();
+      }
+      fs.writeFileSync(file, '{"status":"completed","contextUsage":{"contextWindow":500000,"tokens":-1,"percent":10}}');
+      expect(formatContextUsage(readInfoFile(file)?.contextUsage)).toBe("?%/500k");
+      fs.writeFileSync(file, "null");
+      expect(readInfoFile(file)).toBeUndefined();
+      fs.writeFileSync(file, "{");
+      expect(readInfoFile(file)).toBeUndefined();
+      fs.rmSync(file);
+      expect(readInfoFile(file)).toBeUndefined();
+    } finally {
+      fs.rmSync(directory, { recursive: true, force: true });
+    }
+  });
+});
+
+describe("context usage sampling", () => {
+  const initialUsage = { tokens: 50000, contextWindow: 500000, percent: 10 };
+  const nextUsage = { tokens: 60000, contextWindow: 500000, percent: 12 };
+  let manager: InstanceType<typeof AgentManager>;
+  let info: AgentInfo;
+  let live: any;
+  let commands: any[];
+  const tick = () => new Promise((resolve) => setTimeout(resolve, 0));
+  const emit = (event: any) => manager["handleLine"](live, JSON.stringify(event));
+  const reply = (command: any, data: any, success = true) => emit({
+    type: "response", id: command.id, success, data, error: success ? undefined : "statistics unavailable",
+  });
+  const refresh = () => manager["requestContextRefresh"](live);
+
+  beforeEach(async () => {
+    manager = new AgentManager();
+    await manager.ready();
+    const parentSessionId = `context-unit-${randomUUID()}`;
+    const directory = path.join(getRunsDir(), parentScopeKey(parentSessionId));
+    fs.mkdirSync(directory, { recursive: true });
+    const id = randomUUID();
+    info = {
+      id, taskName: "worker", canonicalName: "/worker", parentSessionId,
+      provider: "test", modelId: "fake", model: "test:fake", cwd: TEST_AGENT_DIR,
+      infoFile: path.join(directory, `${id}.info.json`),
+      sessionFile: path.join(directory, `${id}.jsonl`), logFile: path.join(directory, `${id}.log`),
+      createdAt: 1, updatedAt: 1, lastActivity: 1, messageCount: 1, status: "running",
+      contextUsage: { ...initialUsage },
+      childProcess: { pid: -1, processIdentity: "fixture", token: randomUUID(), ownerPid: process.pid, startedAt: 1 },
+    };
+    fs.writeFileSync(info.infoFile, JSON.stringify(info));
+    commands = [];
+    let resolveExit!: () => void;
+    live = {
+      info, proc: { stdin: {
+        write(payload: string, callback: (error?: Error) => void) { commands.push(JSON.parse(payload)); callback(); },
+        end() { live.processFinished = true; resolveExit(); },
+      } },
+      pending: new Map(), reqId: 0, stderr: "", expectedExit: false, processFinished: false,
+      finalizedRun: false, awaitingPrompt: false, candidateResponse: "", lastActivityPersistedAt: 1,
+      contextEpoch: 0, contextRefreshDirty: false, logger: { info: mock(() => {}) },
+      broadcaster: { broadcast: mock(() => {}) },
+      exitPromise: new Promise<void>((resolve) => { resolveExit = resolve; }),
+    };
+    manager["live"].set(info.id, live);
+  });
+
+  afterEach(async () => {
+    live.processFinished = true;
+    for (const pending of live.pending.values()) {
+      clearTimeout(pending.timer);
+      pending.reject(new Error("fixture disposed"));
+    }
+    live.pending.clear();
+    await live.contextRefresh;
+    manager["live"].delete(info.id);
+    await manager.shutdown();
+    fs.rmSync(path.dirname(info.infoFile), { recursive: true, force: true });
+  });
+
+  test("samples only native current usage and leaves lifecycle and activity untouched", async () => {
+    refresh();
+    expect(commands.map((command) => command.type)).toEqual(["get_session_stats"]);
+    reply(commands[0], { tokens: { total: 110000, cacheRead: 90000 }, contextUsage: nextUsage });
+    await live.contextRefresh;
+    const saved = readInfoFile(info.infoFile)!;
+    expect(saved.contextUsage).toEqual(nextUsage);
+    expect(formatContextUsage(saved.contextUsage)).toBe("12%/500k");
+    expect(saved).toMatchObject({ status: "running", lastActivity: 1, messageCount: 1, childProcess: info.childProcess });
+    expect(live.info.contextUsage).toEqual(nextUsage);
+    expect(live.contextRefresh).toBeUndefined();
+    const updatedAt = saved.updatedAt;
+    refresh();
+    reply(commands[1], { contextUsage: nextUsage });
+    await live.contextRefresh;
+    expect(readInfoFile(info.infoFile)?.updatedAt).toBe(updatedAt);
+  });
+
+  test("coalesces message and turn bursts into one in-flight request and one follow-up", async () => {
+    for (const role of ["user", "assistant", "toolResult", "system", "custom"]) {
+      emit({ type: "message_end", message: { role, content: [] } });
+    }
+    emit({ type: "turn_end" });
+    emit({ type: "entry_appended", entry: { type: "message" } });
+    emit({ type: "entry_appended", entry: { type: "custom_message" } });
+    expect(commands).toHaveLength(1);
+    expect(live.pending.size).toBe(1);
+    reply(commands[0], { contextUsage: nextUsage });
+    await tick();
+    expect(commands).toHaveLength(2);
+    expect(live.pending.size).toBe(1);
+    reply(commands[1], { contextUsage: nextUsage });
+    await live.contextRefresh;
+    const updatedAt = readInfoFile(info.infoFile)?.updatedAt;
+    live.lastActivityPersistedAt = Date.now();
+    for (let index = 0; index < 50; index++) {
+      emit({ type: "message_update", assistantMessageEvent: { type: "text_delta", delta: "x" } });
+      emit({ type: "tool_execution_update" });
+      emit({ type: "queue_update" });
+      emit({ type: "entry_appended", entry: { type: "custom" } });
+    }
+    expect(commands).toHaveLength(2);
+    expect(readInfoFile(info.infoFile)?.updatedAt).toBe(updatedAt);
+  });
+
+  test("distinguishes rejected, timed-out, missing and valid unknown statistics", async () => {
+    refresh();
+    reply(commands[0], undefined, false);
+    await live.contextRefresh;
+    expect(readInfoFile(info.infoFile)?.contextUsage).toEqual(initialUsage);
+    refresh();
+    await live.contextRefresh; // Real sendCommand timeout, no automatic retry.
+    expect(commands).toHaveLength(2);
+    expect(readInfoFile(info.infoFile)?.contextUsage).toEqual(initialUsage);
+    await tick();
+    expect(commands).toHaveLength(2);
+    refresh();
+    reply(commands[2], { tokens: { total: 1000000 } });
+    await live.contextRefresh;
+    expect(readInfoFile(info.infoFile)?.contextUsage).toBeUndefined();
+    expect(live.info.contextUsage).toBeUndefined();
+    refresh();
+    reply(commands[3], { contextUsage: { tokens: null, percent: null, contextWindow: 500000 } });
+    await live.contextRefresh;
+    expect(formatContextUsage(readInfoFile(info.infoFile)?.contextUsage)).toBe("?%/500k");
+    expect(readInfoFile(info.infoFile)?.status).toBe("running");
+    expect(manager["mailbox"]).toHaveLength(0);
+  });
+
+  test.each([
+    { type: "compaction_end", result: { summary: "success" } },
+    { type: "entry_appended", entry: { type: "context_edit" } },
+    { type: "entry_appended", entry: { type: "compaction" } },
+  ])("invalidates known usage before a late pre-edit response %#", async (event) => {
+    refresh();
+    emit(event);
+    expect(live.contextEpoch).toBe(1);
+    expect(formatContextUsage(readInfoFile(info.infoFile)?.contextUsage)).toBe("?%/500k");
+    reply(commands[0], { contextUsage: { ...initialUsage, percent: 95 } });
+    await tick();
+    expect(commands).toHaveLength(2);
+    expect(formatContextUsage(readInfoFile(info.infoFile)?.contextUsage)).toBe("?%/500k");
+    reply(commands[1], undefined, false);
+    await live.contextRefresh;
+    expect(formatContextUsage(readInfoFile(info.infoFile)?.contextUsage)).toBe("?%/500k");
+    expect(readInfoFile(info.infoFile)?.lastActivity).toBe(1);
+  });
+
+  test("failed or canceled compaction does not invalidate or sample", () => {
+    emit({ type: "compaction_end", aborted: true });
+    emit({ type: "compaction_end", errorMessage: "failed" });
+    emit({ type: "compaction_start", reason: "threshold" });
+    expect(live.contextEpoch).toBe(0);
+    expect(commands).toHaveLength(0);
+    expect(readInfoFile(info.infoFile)?.contextUsage).toEqual(initialUsage);
+  });
+
+  test("all lifecycle gates stop both starting and saving background queries", async () => {
+    for (const flag of ["awaitingPrompt", "finalizedRun", "expectedExit", "processFinished"]) {
+      live[flag] = true;
+      const count = commands.length;
+      refresh();
+      expect(commands).toHaveLength(count);
+      live[flag] = false;
+      refresh();
+      live[flag] = true;
+      reply(commands.at(-1), { contextUsage: nextUsage });
+      await live.contextRefresh;
+      expect(readInfoFile(info.infoFile)?.contextUsage).toEqual(initialUsage);
+      live[flag] = false;
+    }
+    const owner = live.info.childProcess;
+    delete live.info.childProcess;
+    const count = commands.length;
+    refresh();
+    expect(commands).toHaveLength(count);
+    live.info.childProcess = owner;
+  });
+
+  test("late callbacks cannot recreate metadata, replace ownership or write from an old instance", async () => {
+    const original = fs.readFileSync(info.infoFile, "utf8");
+    for (const mode of ["deleted", "owner-cleared", "owner-replaced", "instance-replaced"]) {
+      fs.writeFileSync(info.infoFile, original);
+      refresh();
+      if (mode === "deleted") fs.rmSync(info.infoFile);
+      else if (mode === "instance-replaced") manager["live"].set(info.id, { ...live });
+      else {
+        const persisted = JSON.parse(original);
+        if (mode === "owner-cleared") delete persisted.childProcess;
+        else persisted.childProcess.token = "new-owner";
+        fs.writeFileSync(info.infoFile, JSON.stringify(persisted));
+      }
+      const before = fs.existsSync(info.infoFile) ? fs.readFileSync(info.infoFile, "utf8") : undefined;
+      reply(commands.at(-1), { contextUsage: nextUsage });
+      await live.contextRefresh;
+      expect(fs.existsSync(info.infoFile) ? fs.readFileSync(info.infoFile, "utf8") : undefined).toBe(before);
+      manager["live"].set(info.id, live);
+    }
+  });
+
+  test("merges with current persisted lifecycle but never copies it back into live state", async () => {
+    refresh();
+    const persisted = { ...info, status: "completed", finalResponse: "preserve", completedAt: 123, lastActivity: 123 };
+    fs.writeFileSync(info.infoFile, JSON.stringify(persisted));
+    reply(commands[0], { contextUsage: nextUsage });
+    await live.contextRefresh;
+    expect(readInfoFile(info.infoFile)).toMatchObject({
+      status: "completed", finalResponse: "preserve", completedAt: 123, lastActivity: 123,
+      childProcess: persisted.childProcess, contextUsage: nextUsage,
+    });
+    expect(live.info.status).toBe("running");
+    expect(live.info.lastActivity).toBe(1);
+    emit({ type: "turn_end" });
+    expect(live.finalizedRun).toBe(true);
+    expect(commands).toHaveLength(1);
+  });
+
+  test("retries an identical sample after an atomic write failure without advancing memory", async () => {
+    const temporary = `${info.infoFile}.${process.pid}.tmp`;
+    fs.mkdirSync(temporary);
+    live.logger.info = mock(() => { throw new Error("log storage also unavailable"); });
+    refresh();
+    reply(commands[0], { contextUsage: nextUsage });
+    await live.contextRefresh;
+    expect(readInfoFile(info.infoFile)?.contextUsage).toEqual(initialUsage);
+    expect(live.info.contextUsage).toEqual(initialUsage);
+    expect(live.logger.info).toHaveBeenCalledTimes(1);
+    fs.rmSync(temporary, { recursive: true });
+    emit({ type: "turn_end" });
+    reply(commands[1], { contextUsage: nextUsage });
+    await live.contextRefresh;
+    expect(readInfoFile(info.infoFile)?.contextUsage).toEqual(nextUsage);
+  });
+
+  test("online steer saves the canonical live object after sampling during its await", async () => {
+    const delivery = manager.sendMessage(info.parentSessionId, "worker", "new direction");
+    await tick();
+    expect(commands[0].type).toBe("steer");
+    emit({ type: "turn_end" });
+    reply(commands[1], { contextUsage: nextUsage });
+    await live.contextRefresh;
+    reply(commands[0], {});
+    expect(await delivery).toEqual({ delivery: "steer" });
+    expect(readInfoFile(info.infoFile)).toMatchObject({
+      contextUsage: nextUsage, status: "running", childProcess: info.childProcess, lastTaskMessage: "new direction",
+    });
+  });
+
+  test("online controls keep their original persisted-status decisions when another manager has interrupted the run", async () => {
+    fs.writeFileSync(info.infoFile, JSON.stringify({ ...info, status: "interrupted" }));
+    expect(await manager.interruptAgent(info.parentSessionId, "worker")).toEqual({ previous_status: "interrupted" });
+    expect(commands).toHaveLength(0);
+    expect(manager["mailbox"]).toHaveLength(0);
+    const delivery = manager.sendMessage(info.parentSessionId, "worker", "resume");
+    await tick();
+    expect(commands.map((command) => command.type)).toEqual(["prompt"]);
+    reply(commands[0], {});
+    expect(await delivery).toEqual({ delivery: "prompt" });
+    expect(commands[1].type).toBe("get_session_stats");
+    reply(commands[1], { contextUsage: nextUsage });
+    await live.contextRefresh;
+    expect(readInfoFile(info.infoFile)).toMatchObject({ status: "running", contextUsage: nextUsage });
+  });
+
+  test("settlement delivers completion before final sampling, and old background results cannot overwrite it", async () => {
+    refresh();
+    emit({ type: "message_end", message: { role: "assistant", content: [{ type: "text", text: "done" }] } });
+    emit({ type: "agent_settled" });
+    expect(commands.map((command) => command.type)).toEqual(["get_session_stats", "abort", "get_session_stats"]);
+    expect(live.expectedExit).toBe(true);
+    expect(live.termination).toBeInstanceOf(Promise);
+    expect(readInfoFile(info.infoFile)).toMatchObject({ status: "completed", finalResponse: "done" });
+    expect((await manager.waitAgent(info.parentSessionId, ["worker"])).event?.finalResponse).toBe("done");
+    // Both management responses are decoded from a single data block.
+    const decoder = new RpcJsonlDecoder();
+    const records = [
+      { type: "response", id: commands[2].id, success: true, data: { contextUsage: nextUsage } },
+      { type: "response", id: commands[0].id, success: true, data: { contextUsage: initialUsage } },
+      { type: "response", id: commands[1].id, success: true, data: {} },
+    ];
+    for (const line of decoder.push(Buffer.from(records.map((record) => JSON.stringify(record) + "\n").join("")))) {
+      manager["handleLine"](live, line);
+    }
+    await live.termination;
+    await live.contextRefresh;
+    expect(readInfoFile(info.infoFile)).toMatchObject({ status: "completed", finalResponse: "done", contextUsage: nextUsage });
+    expect(live.contextRefreshDirty).toBe(false);
+  });
+
+  test("final sampling keeps its original token even if a late event adopts another owner's final record", async () => {
+    emit({ type: "agent_settled" });
+    const replacement = {
+      ...readInfoFile(info.infoFile)!, status: "failed", error: "replacement run",
+      contextUsage: nextUsage, childProcess: { ...info.childProcess!, token: "replacement-token" },
+    };
+    fs.writeFileSync(info.infoFile, JSON.stringify(replacement));
+    emit({ type: "turn_end" });
+    expect(live.info.childProcess?.token).toBe("replacement-token");
+    const before = fs.readFileSync(info.infoFile, "utf8");
+    reply(commands[1], { contextUsage: { ...initialUsage, percent: 90 } });
+    reply(commands[0], {});
+    await live.termination;
+    expect(fs.readFileSync(info.infoFile, "utf8")).toBe(before);
+  });
+
+  test("a timed-out final query retains the snapshot and continues termination", async () => {
+    emit({ type: "agent_settled" });
+    expect(manager["mailbox"]).toHaveLength(1);
+    reply(commands[0], {});
+    await live.termination;
+    expect(live.processFinished).toBe(true);
+    expect(live.pending.size).toBe(0);
+    expect(readInfoFile(info.infoFile)?.contextUsage).toEqual(initialUsage);
+    expect(manager["mailbox"]).toHaveLength(1);
+  });
+
+  test("a failed final sample cannot prevent SIGTERM/forced-kill escalation", async () => {
+    const escalation: string[] = [];
+    live.proc.stdin.end = mock(() => {});
+    manager["signalProcessTree"] = (_live, signal) => {
+      escalation.push(signal);
+      if (signal === "SIGKILL") {
+        live.processFinished = true;
+        live.exitPromise = Promise.resolve();
+      }
+    };
+    manager["forceKillWindowsTree"] = async () => {
+      escalation.push("windows-kill");
+      live.processFinished = true;
+      live.exitPromise = Promise.resolve();
+    };
+    emit({ type: "agent_settled" });
+    reply(commands[0], {});
+    reply(commands[1], {}, false);
+    await live.termination;
+    expect(escalation).toEqual(["SIGTERM", process.platform === "win32" ? "windows-kill" : "SIGKILL"]);
+    expect(live.proc.stdin.end).toHaveBeenCalledTimes(1);
+    expect(readInfoFile(info.infoFile)).toMatchObject({ status: "completed", contextUsage: initialUsage });
+    expect(manager["mailbox"]).toHaveLength(1);
+  });
+
+  test.each(["interrupt", "shutdown"])("forced %s does not request final statistics", async (action) => {
+    const ending = action === "interrupt" ? manager.interruptAgent(info.parentSessionId, "worker") : manager.shutdown();
+    await tick();
+    expect(commands.map((command) => command.type)).toEqual(["abort"]);
+    expect(readInfoFile(info.infoFile)).toMatchObject({ status: "interrupted", contextUsage: initialUsage });
+    reply(commands[0], {});
+    await ending;
+  });
+
+  test("prompt rejection preserves the previous final snapshot and never triggers acceptance sampling", async () => {
+    live.info.status = "completed";
+    live.info.finalResponse = "previous";
+    live.info.completedAt = 99;
+    const rejected = manager["prompt"](live, "reject", "reject").then(() => undefined, (error) => error);
+    expect(commands.map((command) => command.type)).toEqual(["prompt"]);
+    reply(commands[0], {}, false);
+    expect(await rejected).toBeInstanceOf(Error);
+    expect(readInfoFile(info.infoFile)).toMatchObject({ status: "completed", finalResponse: "previous", contextUsage: initialUsage });
+    expect(commands).toHaveLength(1);
+  });
+});
+
+describe("context usage RPC integration", () => {
+  let manager: InstanceType<typeof AgentManager>;
+  let parentSessionId: string;
+  const usage = (percent: number, contextWindow = 500000) => ({
+    tokens: percent * contextWindow / 100, contextWindow, percent,
+  });
+  const configure = (responses: any) => { process.env.PI_SUBAGENT_TEST_MODEL_RESPONSES = JSON.stringify(responses); };
+  const records = (info: AgentInfo) => fs.readFileSync(info.sessionFile, "utf8").trim().split("\n").map((line) => JSON.parse(line));
+  const countStats = (info: AgentInfo) => records(info).filter((record) => record.type === "get_session_stats").length;
+
+  beforeEach(async () => {
+    process.env.PI_SUBAGENT_PI_BIN = FAKE_RPC_CHILD;
+    parentSessionId = `context-rpc-${randomUUID()}`;
+    manager = new AgentManager();
+    await manager.ready();
+  });
+
+  afterEach(async () => {
+    await manager.shutdown();
+    fs.rmSync(path.join(getRunsDir(), parentScopeKey(parentSessionId)), { recursive: true, force: true });
+    delete process.env.PI_SUBAGENT_PI_BIN;
+    delete process.env.PI_SUBAGENT_TEST_MODEL_RESPONSES;
+  });
+
+  test("saves a final native snapshot, resumes the same session without resetting it, and interrupts without extra sampling", async () => {
+    configure({ contextResponses: [
+      { data: { tokens: { total: 110000 }, contextUsage: usage(12) } },
+      { data: { contextUsage: usage(14) } },
+    ] });
+    await manager.spawnAgent(spawnParams(parentSessionId, "worker", "first"));
+    const first = manager.getAgentInfo("worker", parentSessionId);
+    expect((await manager.waitAgent(parentSessionId, ["worker"])).event?.finalResponse).toBe("response:first");
+    await waitUntil(() => !manager.getAgentInfo("worker", parentSessionId).childProcess);
+    expect(formatContextUsage(manager.getAgentInfo("worker", parentSessionId).contextUsage)).toBe("14%/500k");
+    expect(countStats(first)).toBeGreaterThanOrEqual(2);
+
+    configure({ contextResponses: [{ hold: true }] });
+    expect(await manager.sendMessage(parentSessionId, "worker", "hold resumed")).toEqual({ delivery: "prompt" });
+    const resumed = manager.getAgentInfo("worker", parentSessionId);
+    const live = manager["live"].get(first.id)!;
+    expect(resumed.id).toBe(first.id);
+    expect(resumed.sessionFile).toBe(first.sessionFile);
+    expect(resumed.contextUsage).toEqual(usage(14));
+    expect(resumed.childProcess?.pid).not.toBe(first.childProcess?.pid);
+    await waitUntil(() => records(resumed).filter((record) => record.pid === resumed.childProcess?.pid && record.type === "get_session_stats").length === 1);
+    const before = countStats(resumed);
+    await manager.interruptAgent(parentSessionId, "worker");
+    await live.contextRefresh;
+    expect(countStats(resumed)).toBe(before);
+    expect(live.pending.size).toBe(0);
+    expect(live.contextRefresh).toBeUndefined();
+    expect(manager.getAgentInfo("worker", parentSessionId)).toMatchObject({ status: "interrupted", contextUsage: usage(14) });
+    expect(records(resumed).filter((record) => record.type === "prompt").map((record) => record.message)).toEqual(["first", "hold resumed"]);
+  });
+
+  test("settled continuation waits for a timed-out final query instead of steering the exiting process", async () => {
+    configure({ contextResponses: [{ data: { contextUsage: usage(10) } }, { hold: true }] });
+    await manager.spawnAgent(spawnParams(parentSessionId, "worker", "first"));
+    const first = manager.getAgentInfo("worker", parentSessionId);
+    const oldLive = manager["live"].get(first.id)!;
+    const completed = await manager.waitAgent(parentSessionId, ["worker"]);
+    expect(completed.event?.status).toBe("completed");
+    expect(oldLive.expectedExit).toBe(true);
+    expect(oldLive.processFinished).toBe(false);
+    expect(manager.getAgentInfo("worker", parentSessionId).contextUsage).toEqual(usage(10));
+    expect(await manager.sendMessage(parentSessionId, "worker", "hold continuation")).toEqual({ delivery: "prompt" });
+    expect(oldLive.processFinished).toBe(true);
+    await oldLive.contextRefresh;
+    expect(oldLive.pending.size).toBe(0);
+    const resumed = manager.getAgentInfo("worker", parentSessionId);
+    expect(resumed.childProcess?.pid).not.toBe(first.childProcess?.pid);
+    const sessionRecords = records(resumed);
+    expect(sessionRecords.filter((record) => record.type === "started")).toHaveLength(2);
+    expect(sessionRecords.filter((record) => record.type === "steer")).toHaveLength(0);
+    expect(sessionRecords.filter((record) => record.type === "prompt").map((record) => record.message)).toEqual(["first", "hold continuation"]);
+    expect(resumed.contextUsage).toEqual(usage(10));
+  });
+
+  test("steer and event sampling interleave without losing a newer snapshot or process ownership", async () => {
+    configure({
+      contextResponses: [{ data: { contextUsage: usage(10) } }, { data: { contextUsage: usage(12) } }],
+      steerDelayMs: 150,
+      steerEvents: [{ event: { type: "message_end", message: { role: "user", content: "steered" } } }],
+    });
+    await manager.spawnAgent(spawnParams(parentSessionId, "worker", "hold steer"));
+    await waitUntil(() => manager.getAgentInfo("worker", parentSessionId).contextUsage?.percent === 10);
+    const started = manager.getAgentInfo("worker", parentSessionId);
+    const delivery = manager.sendMessage(parentSessionId, "worker", "new direction");
+    await waitUntil(() => manager.getAgentInfo("worker", parentSessionId).contextUsage?.percent === 12);
+    expect(await delivery).toEqual({ delivery: "steer" });
+    expect(manager.getAgentInfo("worker", parentSessionId)).toMatchObject({
+      status: "running", contextUsage: usage(12), childProcess: started.childProcess, lastTaskMessage: "new direction",
+    });
+  });
+
+  test("a successful compaction in the old response's stdout chunk invalidates it even if the next query fails", async () => {
+    configure({
+      contextResponses: [
+        { data: { contextUsage: usage(10) } },
+        { data: { contextUsage: usage(95) }, events: [{ type: "compaction_end", result: { summary: "compacted" } }] },
+        { success: false },
+      ],
+      steerEvents: [{ event: { type: "turn_end" } }],
+    });
+    await manager.spawnAgent(spawnParams(parentSessionId, "worker", "hold compaction"));
+    await waitUntil(() => manager.getAgentInfo("worker", parentSessionId).contextUsage?.percent === 10);
+    await manager.sendMessage(parentSessionId, "worker", "compact now");
+    const info = manager.getAgentInfo("worker", parentSessionId);
+    const live = manager["live"].get(info.id)!;
+    await waitUntil(() => live.contextEpoch === 1 && countStats(info) === 3 && !live.contextRefresh);
+    expect(formatContextUsage(manager.getAgentInfo("worker", parentSessionId).contextUsage)).toBe("?%/500k");
+    await new Promise((resolve) => setTimeout(resolve, 30));
+    expect(countStats(info)).toBe(3);
+    expect(manager.getAgentInfo("worker", parentSessionId).status).toBe("running");
+  });
+
+  test("different children use their own native windows rather than a parent model window", async () => {
+    configure({ contextResponses: [{ data: { contextUsage: usage(10, 500000) } }] });
+    await manager.spawnAgent(spawnParams(parentSessionId, "small", "hold small"));
+    configure({ contextResponses: [{ data: { contextUsage: usage(20, 1050000) } }] });
+    await manager.spawnAgent({ ...spawnParams(parentSessionId, "large", "hold large"), inheritedModelId: "template-model" });
+    await waitUntil(() => Boolean(manager.getAgentInfo("small", parentSessionId).contextUsage && manager.getAgentInfo("large", parentSessionId).contextUsage));
+    expect(formatContextUsage(manager.getAgentInfo("small", parentSessionId).contextUsage)).toBe("10%/500k");
+    expect(formatContextUsage(manager.getAgentInfo("large", parentSessionId).contextUsage)).toBe("20%/1.05M");
+  });
+
+  test("old final responses and process-exit cleanup cannot mutate a replacement owner's record", async () => {
+    configure({ contextResponses: [
+      { data: { contextUsage: usage(10) } },
+      { data: { contextUsage: usage(12) }, delayMs: 150 },
+    ] });
+    await manager.spawnAgent(spawnParams(parentSessionId, "worker", "slow first"));
+    const initial = manager.getAgentInfo("worker", parentSessionId);
+    const live = manager["live"].get(initial.id)!;
+    await manager.waitAgent(parentSessionId, ["worker"]);
+    const replacement = {
+      ...manager.getAgentInfo("worker", parentSessionId), status: "failed", error: "replacement run",
+      contextUsage: usage(67), childProcess: { ...initial.childProcess!, token: "replacement-token" },
+    };
+    fs.writeFileSync(initial.infoFile, JSON.stringify(replacement));
+    manager["handleLine"](live, JSON.stringify({ type: "turn_end" }));
+    expect(live.info.childProcess?.token).toBe("replacement-token");
+    const before = fs.readFileSync(initial.infoFile, "utf8");
+    await live.termination;
+    await live.contextRefresh;
+    expect(live.processFinished).toBe(true);
+    expect(fs.readFileSync(initial.infoFile, "utf8")).toBe(before);
+    expect(manager.getAgentInfo("worker", parentSessionId).childProcess?.token).toBe("replacement-token");
+  });
+
+  test("unexpected exit rejects pending statistics without reviving ownership or changing failure delivery", async () => {
+    configure({ contextResponses: [{ hold: true }] });
+    await manager.spawnAgent(spawnParams(parentSessionId, "worker", "crash now"));
+    const info = manager.getAgentInfo("worker", parentSessionId);
+    const live = manager["live"].get(info.id)!;
+    expect((await manager.waitAgent(parentSessionId, ["worker"])).event?.status).toBe("failed");
+    await waitUntil(() => !manager.getAgentInfo("worker", parentSessionId).childProcess);
+    await live.contextRefresh;
+    expect(live.pending.size).toBe(0);
+    expect(live.contextRefresh).toBeUndefined();
+    const failed = manager.getAgentInfo("worker", parentSessionId);
+    expect(failed.status).toBe("failed");
+    expect(failed.contextUsage).toBeUndefined();
+    expect(failed.childProcess).toBeUndefined();
+    expect(countStats(info)).toBe(1);
+  });
+});
+
+test("real Pi RPC reports current context rather than billing totals and clears pre-compaction usage", async () => {
+  const directory = fs.mkdtempSync(path.join(TEST_AGENT_DIR, "native-context-rpc-"));
+  const provider = "context-test";
+  const model = "context-fixture";
+  const api = "openai-completions";
+  fs.writeFileSync(path.join(directory, "models.json"), JSON.stringify({
+    providers: { [provider]: {
+      api, apiKey: "offline-fixture", baseUrl: "http://127.0.0.1:9/v1",
+      models: [{ id: model, contextWindow: 500000, maxTokens: 1024, input: ["text"], reasoning: false }],
+    } },
+  }));
+  const makeSession = (count: number, compacted = false, afterCompaction = false) => {
+    const session = codingAgent.SessionManager.create(directory, directory);
+    session.appendModelChange(provider, model);
+    session.appendMessage({ role: "user", content: "saved context", timestamp: 1 });
+    const appendAssistant = (tokens: number) => session.appendMessage({
+      role: "assistant", content: [{ type: "text", text: "saved response" }],
+      api, provider, model, stopReason: "stop", timestamp: 2,
+      usage: { input: tokens, output: 0, cacheRead: 0, cacheWrite: 0, totalTokens: tokens,
+        cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 } },
+    });
+    appendAssistant(50000);
+    if (count > 1) appendAssistant(60000);
+    if (compacted) session.appendCompaction("saved summary", null, 60000);
+    if (afterCompaction) appendAssistant(40000);
+    return session.getSessionFile()!;
+  };
+  const sessions = [makeSession(1), makeSession(2), makeSession(2, true), makeSession(2, true, true)];
+  const client = new codingAgent.RpcClient({
+    cliPath: path.join(path.dirname(Bun.resolveSync("@earendil-works/pi-coding-agent", import.meta.dir)), "cli.js"),
+    cwd: directory, provider, model,
+    env: { PI_CODING_AGENT_DIR: directory, PI_OFFLINE: "1", PI_SKIP_VERSION_CHECK: "1", PI_TELEMETRY: "0" },
+    args: ["--no-extensions", "--no-skills", "--no-prompt-templates", "--no-context-files", "--no-builtin-tools", "--session", sessions[0]],
+  });
+  try {
+    await client.start();
+    expect((await client.getState()).model).toMatchObject({ provider, id: model });
+    const first = await client.getSessionStats();
+    expect(first.contextUsage).toEqual({ tokens: 50000, contextWindow: 500000, percent: 10 });
+    expect(formatContextUsage(first.contextUsage)).toBe("10%/500k");
+    await client.switchSession(sessions[1]);
+    const second = await client.getSessionStats();
+    expect(second.tokens.total).toBe(110000);
+    expect(second.contextUsage).toEqual({ tokens: 60000, contextWindow: 500000, percent: 12 });
+    expect(formatContextUsage(second.contextUsage)).toBe("12%/500k");
+    await client.switchSession(sessions[2]);
+    const compacted = await client.getSessionStats();
+    expect(compacted.contextUsage).toEqual({ tokens: null, contextWindow: 500000, percent: null });
+    expect(formatContextUsage(compacted.contextUsage)).toBe("?%/500k");
+    await client.switchSession(sessions[3]);
+    expect(formatContextUsage((await client.getSessionStats()).contextUsage)).toBe("8%/500k");
+  } finally {
+    await client.stop();
+    fs.rmSync(directory, { recursive: true, force: true });
+  }
+});
+
+test("context usage flows through public tools, child RPC, metadata and the detail footer only, including history", async () => {
+  process.env.PI_SUBAGENT_PI_BIN = FAKE_RPC_CHILD;
+  process.env.PI_SUBAGENT_TEST_MODEL_RESPONSES = JSON.stringify({
+    contextResponses: [10, 12, 14].map((percent) => ({
+      data: { tokens: { total: 999999 }, contextUsage: { tokens: percent * 5000, contextWindow: 500000, percent } },
+    })),
+    steerEvents: [{ event: { type: "turn_end" } }],
+  });
+  const parentId = `context-full-chain-${randomUUID()}`;
+  const scope = path.join(getRunsDir(), parentScopeKey(parentId));
+  const tools = new Map<string, any>();
+  const commands = new Map<string, any>();
+  const handlers = new Map<string, any>();
+  const theme = { fg: (_color: string, text: string) => text, bold: (text: string) => text };
+  const ctx: any = {
+    mode: "tui", cwd: TEST_AGENT_DIR, model: { provider: "test", id: "fake" },
+    modelRegistry: { getAvailable: () => [{ provider: "test", id: "fake" }] },
+    sessionManager: { getSessionId: () => parentId },
+    ui: { notify: mock(() => {}), setWidget() {} },
+  };
+  const { default: extension } = await import("./index.js");
+  const execute = (name: string, params: any) => tools.get(name).execute("context-e2e", params, undefined, undefined, ctx);
+  try {
+    await extension({
+      on(name: string, handler: any) { handlers.set(name, handler); },
+      registerTool(tool: any) { tools.set(tool.name, tool); },
+      registerCommand(name: string, command: any) { commands.set(name, command); },
+      registerShortcut() {}, registerMessageRenderer() {}, sendMessage() {},
+      getThinkingLevel: () => "high", getActiveTools: () => ["read"],
+      getSettings: () => ({ terminal: { showImages: false }, outputPad: 0 }),
+    } as any);
+    await handlers.get("session_start")({}, ctx);
+    const spawned = await execute("spawn_agent", { task_name: "worker", message: "hold context full chain" });
+    expect(spawned.content[0].text).toBe("Spawned /worker.");
+    await waitUntil(() => getAgent("worker", parentId)?.contextUsage?.percent === 10);
+    const overlayFrames: string[] = [];
+    let opened = 0;
+    ctx.ui.custom = async (create: any) => {
+      let component: any;
+      let result: any;
+      const tui = { terminal: { rows: 35 }, requestRender() {
+        if (!(component instanceof SubagentPeekOverlay)) return;
+        overlayFrames.push(stripVTControlCharacters(component.render(80).join("\n")));
+      } };
+      component = create(tui, theme, {}, (value: any) => { result = value; component.dispose?.(); });
+      try {
+        if (!(component instanceof SubagentPeekOverlay)) {
+          const browserLines = component.render(80);
+          expect(browserLines.join("\n")).not.toMatch(/ctx |Context:|%\/500k/);
+          expect((await execute("send_message", { target: "worker", message: "sample twelve" })).details.delivery).toBe("steer");
+          await waitUntil(() => getAgent("worker", parentId)?.contextUsage?.percent === 12);
+          expect(component.render(80)).toBe(browserLines);
+          component.handleInput("\r");
+        } else {
+          opened++;
+          expect(component.render(80).at(-2)).toContain("│ 12%/500k │ ←/→ agent");
+          expect(component.render(80).join("\n")).not.toContain("Context:");
+          await execute("send_message", { target: "worker", message: "sample fourteen" });
+          await waitUntil(() => overlayFrames.some((frame) => frame.includes("│ 14%/500k │ ←/→ agent")));
+          component.handleInput("q");
+        }
+        return result;
+      } finally {
+        component.dispose?.();
+      }
+    };
+    await commands.get("subagents").handler("", ctx);
+    expect(opened).toBe(1);
+    expect((await execute("list_agents", {})).content[0].text).not.toContain("contextUsage");
+    expect((await execute("interrupt_agent", { target: "worker" })).details.previous_status).toBe("running");
+    const saved = getAgent("worker", parentId)!;
+    expect(saved.childProcess).toBeUndefined();
+    expect(saved.contextUsage).toEqual({ tokens: 70000, contextWindow: 500000, percent: 14 });
+    const beforeHistory = fs.readFileSync(saved.sessionFile, "utf8");
+    let historyOpened = 0;
+    ctx.ui.custom = async (create: any) => {
+      let component: any;
+      let result: any;
+      component = create({ terminal: { rows: 35 }, requestRender() {} }, theme, {}, (value: any) => {
+        result = value;
+        component.dispose?.();
+      });
+      try {
+        if (component instanceof SubagentPeekOverlay) {
+          historyOpened++;
+          expect(component.render(80).at(-2)).toContain("│ 14%/500k │ ←/→ agent");
+          component.handleInput("q");
+        } else {
+          expect(component.render(80).join("\n")).not.toMatch(/ctx |Context:|%\/500k/);
+          component.handleInput("\r");
+        }
+        return result;
+      } finally { component.dispose?.(); }
+    };
+    await commands.get("subagents").handler("", ctx);
+    expect(historyOpened).toBe(1);
+    expect(fs.readFileSync(saved.sessionFile, "utf8")).toBe(beforeHistory);
+    expect(getAgent("worker", parentId)?.childProcess).toBeUndefined();
+    expect(ctx.ui.notify).not.toHaveBeenCalled();
+  } finally {
+    await handlers.get("session_shutdown")?.();
+    fs.rmSync(scope, { recursive: true, force: true });
+    delete process.env.PI_SUBAGENT_PI_BIN;
+    delete process.env.PI_SUBAGENT_TEST_MODEL_RESPONSES;
+  }
 });

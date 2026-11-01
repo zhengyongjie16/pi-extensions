@@ -514,26 +514,33 @@ ${cachedSkills.length ? cachedSkills.map((skill) => `- \`${skill.name}\` — ${s
       if (currentIndex === -1) return;
       const offset = navigation === "next" ? 1 : -1;
       const next = entries[(currentIndex + offset + entries.length) % entries.length];
-      info = manager.getAgentInfo(next.agent_name, next.parent_session_id || currentSessionId);
+      try { info = manager.getAgentInfo(next.agent_name, next.parent_session_id || currentSessionId); }
+      catch (error) { ctx.ui.notify(error instanceof Error ? error.message : String(error), "error"); return; }
     }
   }
 
   async function pickAgent(ctx: any): Promise<{ task: string; parentSessionId: string; includeAll: boolean } | undefined> {
     const currentSessionId = parentSessionId(ctx);
-    return await ctx.ui.custom((tui: any, theme: any, _keybindings: any, done: any) => {
+    return ctx.ui.custom((tui: any, theme: any, _keybindings: any, done: any) => {
       let selected = 0;
       let showAll = false;
+      let displayed: ReturnType<AgentManager["listAgents"]> = [];
+      let displayedSelection: { task: string; parentSessionId: string; includeAll: boolean } | undefined;
       let cached: string[] | undefined;
       let cachedWidth: number | undefined;
       const fg = theme.fg.bind(theme);
       const pageSize = 10;
-      const refresh = () => { cached = undefined; tui.requestRender(); };
-      const agents = () => manager.listAgents(undefined, currentSessionId, showAll);
+      const refresh = () => {
+        cached = undefined;
+        tui.requestRender();
+      };
       return {
         render(width: number): string[] {
           if (cached && cachedWidth === width) return cached;
-          const entries = agents();
-          if (selected >= entries.length) selected = Math.max(0, entries.length - 1);
+          const entries = manager.listAgents(undefined, currentSessionId, showAll);
+          selected = Math.max(0, Math.min(selected, entries.length - 1));
+          displayed = entries;
+          displayedSelection = undefined;
           const scopeLabel = showAll ? "all sessions" : "this session";
           const lines = [fg("accent", "─".repeat(width)), fg("accent", theme.bold(" Subagents")) + fg("dim", ` (${entries.length}, ${scopeLabel})`), ""];
           if (!entries.length) lines.push(fg("dim", showAll ? "No subagents found." : "No subagents for this session. Press tab to show all."));
@@ -548,7 +555,10 @@ ${cachedSkills.length ? cachedSkills.map((skill) => `- \`${skill.name}\` — ${s
           if (viewStart > 0) lines.push(fg("dim", `  ↑ ${viewStart} more`));
           for (let index = viewStart; index < viewEnd; index++) {
             const entry = entries[index];
-            const info = manager.getAgentInfo(entry.agent_name, entry.parent_session_id || currentSessionId);
+            let info: AgentInfo;
+            try { info = manager.getAgentInfo(entry.agent_name, entry.parent_session_id || currentSessionId); }
+            catch { continue; } // A record can disappear between listing and reading its details.
+            if (index === selected) displayedSelection = { task: entry.agent_name, parentSessionId: entry.parent_session_id || currentSessionId, includeAll: showAll };
             const pointer = index === selected ? fg("accent", "› ") : "  ";
             const name = formatColumn(entry.agent_name, nameWidth);
             const sessionId = entry.parent_session_id || "";
@@ -568,15 +578,21 @@ ${cachedSkills.length ? cachedSkills.map((skill) => `- \`${skill.name}\` — ${s
           return cached;
         },
         handleInput(data: string) {
-          const entries = agents();
           if (matchesKey(data, "escape") || data === "q") { done(undefined); return; }
           if (matchesKey(data, "tab") || data === "\t") { showAll = !showAll; selected = 0; refresh(); return; }
           if (data === "r") { refresh(); return; }
-          if (matchesKey(data, "down") || data === "j") { selected = Math.min(entries.length - 1, selected + 1); refresh(); return; }
-          if (matchesKey(data, "up") || data === "k") { selected = Math.max(0, selected - 1); refresh(); return; }
-          if (matchesKey(data, "return") && entries[selected]) {
-            done({ task: entries[selected].agent_name, parentSessionId: entries[selected].parent_session_id || currentSessionId, includeAll: showAll });
+          if (matchesKey(data, "down") || data === "j") {
+            selected = Math.max(0, Math.min(displayed.length - 1, selected + 1));
+            refresh();
+            return;
           }
+          if (matchesKey(data, "up") || data === "k") {
+            selected = Math.max(0, selected - 1);
+            refresh();
+            return;
+          }
+          // Do not query a newer list and apply the index from the last displayed frame.
+          if (matchesKey(data, "return") && displayedSelection) done(displayedSelection);
         },
         invalidate() { cached = undefined; },
       };

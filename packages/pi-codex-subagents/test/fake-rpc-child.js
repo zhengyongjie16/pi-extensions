@@ -18,6 +18,8 @@ const models = [
   { provider: "fireworks", id: "accounts/fireworks/models/glm-5p2" },
 ];
 const modelResponses = JSON.parse(process.env.PI_SUBAGENT_TEST_MODEL_RESPONSES || "{}");
+let statsRequests = 0;
+const defaultStats = { tokens: { total: 110000 }, contextUsage: { tokens: 60000, contextWindow: 500000, percent: 12 } };
 
 function record(value) {
   if (sessionFile) fs.appendFileSync(sessionFile, `${JSON.stringify({ pid: process.pid, ...value })}\n`);
@@ -38,6 +40,21 @@ input.on("line", (line) => {
     const key = command.type === "get_state" ? "state" : "availableModels";
     const data = Object.hasOwn(modelResponses, key) ? modelResponses[key] : key === "state" ? { model: requestedModel } : { models };
     send({ type: "response", id: command.id, success: true, data });
+    return;
+  }
+  if (command.type === "get_session_stats") {
+    const responses = modelResponses.contextResponses ?? [];
+    const response = responses[Math.min(statsRequests++, responses.length - 1)] ?? { data: defaultStats };
+    if (response.hold) return;
+    const reply = () => {
+      // Events and response can deliberately share one stdout chunk to exercise ordering.
+      process.stdout.write([...(response.events ?? []), {
+        type: "response", id: command.id, success: response.success !== false,
+        ...(response.success === false ? { error: response.error ?? "fake statistics failure" } : { data: response.data }),
+      }].map((value) => JSON.stringify(value) + "\n").join(""));
+    };
+    if (response.delayMs) setTimeout(reply, response.delayMs);
+    else reply();
     return;
   }
   if (command.type === "prompt") {
@@ -108,6 +125,13 @@ input.on("line", (line) => {
     return;
   }
   if (command.type === "steer" || command.type === "abort") {
-    send({ type: "response", id: command.id, success: true, data: {} });
+    if (command.type === "steer") {
+      for (const { delayMs = 0, event } of modelResponses.steerEvents ?? []) {
+        setTimeout(() => send(event), delayMs);
+      }
+    }
+    const reply = () => send({ type: "response", id: command.id, success: true, data: {} });
+    if (command.type === "steer" && modelResponses.steerDelayMs) setTimeout(reply, modelResponses.steerDelayMs);
+    else reply();
   }
 });

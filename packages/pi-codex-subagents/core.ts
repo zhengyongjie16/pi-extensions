@@ -6,7 +6,7 @@ import * as net from "node:net";
 import * as os from "node:os";
 import * as path from "node:path";
 import { setTimeout as delay } from "node:timers/promises";
-import { CONFIG_DIR_NAME, getAgentDir } from "@earendil-works/pi-coding-agent";
+import { CONFIG_DIR_NAME, getAgentDir, type ContextUsage } from "@earendil-works/pi-coding-agent";
 import { parseStreamingJson, type AssistantMessage } from "@earendil-works/pi-ai";
 
 export const PACKAGE_BASENAME = "pi-codex-subagents";
@@ -98,6 +98,7 @@ export interface AgentInfo {
   finalResponse?: string;
   error?: string;
   childProcess?: ChildProcessOwnership;
+  contextUsage?: ContextUsage;
 }
 
 export interface AgentListEntry {
@@ -157,6 +158,9 @@ interface LiveAgent {
   candidateError?: string;
   modelResponseTimer?: ReturnType<typeof setTimeout>;
   lastActivityPersistedAt: number;
+  contextRefresh?: Promise<void>;
+  contextRefreshDirty: boolean;
+  contextEpoch: number;
 }
 
 export interface AgentCompletionEvent {
@@ -405,6 +409,32 @@ function normalizeTaskName(name: string): string {
   return normalized;
 }
 
+export function normalizeContextUsage(value: unknown): ContextUsage | undefined {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return undefined;
+  const { contextWindow, tokens, percent } = value as Record<string, unknown>;
+  if (typeof contextWindow !== "number" || !Number.isFinite(contextWindow) || contextWindow <= 0) return undefined;
+  const validUsage = typeof tokens === "number" && Number.isFinite(tokens) && tokens >= 0
+    && typeof percent === "number" && Number.isFinite(percent) && percent >= 0;
+  return { contextWindow, tokens: validUsage ? tokens : null, percent: validUsage ? percent : null };
+}
+
+export function formatContextUsage(value: unknown): string {
+  const usage = normalizeContextUsage(value);
+  if (!usage) return "?%/?";
+  const { contextWindow, percent } = usage;
+  const window = contextWindow >= 1_000_000
+    ? `${Number((contextWindow / 1_000_000).toFixed(2))}M`
+    : contextWindow >= 1_000
+      ? `${Number((contextWindow / 1_000).toFixed(2))}k`
+      : String(contextWindow);
+  const occupied = percent === null ? "?" : percent > 0 && percent < 0.1 ? "<0.1" : String(Number(percent.toFixed(1)));
+  return `${occupied}%/${window}`;
+}
+
+function sameContextUsage(a: ContextUsage | undefined, b: ContextUsage | undefined): boolean {
+  return a?.contextWindow === b?.contextWindow && a?.tokens === b?.tokens && a?.percent === b?.percent;
+}
+
 function saveInfo(info: AgentInfo): void {
   fs.mkdirSync(path.dirname(info.infoFile), { recursive: true });
   info.updatedAt = Date.now();
@@ -413,9 +443,13 @@ function saveInfo(info: AgentInfo): void {
   fs.renameSync(temporary, info.infoFile);
 }
 
-function readInfoFile(file: string): AgentInfo | undefined {
+export function readInfoFile(file: string): AgentInfo | undefined {
   try {
     const info = JSON.parse(fs.readFileSync(file, "utf8")) as Omit<AgentInfo, "status"> & { status: AgentRuntimeStatus | "closed"; closedAt?: number };
+    if (!info || typeof info !== "object" || Array.isArray(info)) return undefined;
+    const contextUsage = normalizeContextUsage(info.contextUsage);
+    if (contextUsage) info.contextUsage = contextUsage;
+    else delete info.contextUsage;
     if (info.status === "closed") {
       info.status = info.error ? "failed" : info.finalResponse !== undefined ? "completed" : "interrupted";
       delete info.closedAt;
@@ -1295,6 +1329,8 @@ export class AgentManager {
       resolveExit,
       candidateResponse: "",
       lastActivityPersistedAt: info.updatedAt,
+      contextRefreshDirty: false,
+      contextEpoch: 0,
     };
     this.live.set(info.id, live);
     const decoder = new RpcJsonlDecoder();
@@ -1302,6 +1338,7 @@ export class AgentManager {
       if (live.processFinished) return;
       this.clearModelResponseTimer(live);
       live.processFinished = true;
+      live.contextRefreshDirty = false;
       const persisted = readInfoFile(live.info.infoFile);
       if (!live.awaitingPrompt && persisted && FINAL_STATUSES.has(persisted.status)) {
         live.info = persisted;
@@ -1315,8 +1352,7 @@ export class AgentManager {
       if (!live.expectedExit && !live.finalizedRun) {
         this.markFailed(live, error?.message ?? "Child Pi process exited unexpectedly.");
       }
-      const ownership = live.info.childProcess;
-      if (ownership) this.clearChildOwnership(live.info, ownership.token);
+      this.clearChildOwnership(live.info, childToken);
       if (this.live.get(info.id) === live) this.live.delete(info.id);
       broadcaster.stop();
       logger.close();
@@ -1445,6 +1481,7 @@ export class AgentManager {
     this.notifyStatusChange(live.info);
     try {
       await this.sendCommand(live, { type: "prompt", message });
+      this.requestContextRefresh(live);
     } catch (error) {
       live.info.status = previousFinalState.status;
       if (previousFinalState.finalResponse !== undefined) live.info.finalResponse = previousFinalState.finalResponse;
@@ -1457,6 +1494,65 @@ export class AgentManager {
       this.notifyStatusChange(live.info);
       throw error;
     }
+  }
+
+  private canRefreshContext(live: LiveAgent): boolean {
+    return this.live.get(live.info.id) === live && Boolean(live.info.childProcess)
+      && !live.awaitingPrompt && !live.finalizedRun && !live.expectedExit && !live.processFinished;
+  }
+
+  private saveContextUsage(live: LiveAgent, value: unknown, token: string | undefined): void {
+    if (this.live.get(live.info.id) !== live || live.processFinished || !token || live.info.childProcess?.token !== token) return;
+    const persisted = readInfoFile(live.info.infoFile);
+    if (persisted?.childProcess?.token !== token) return;
+    const contextUsage = normalizeContextUsage(value);
+    if (sameContextUsage(persisted.contextUsage, contextUsage)) return;
+    const candidate = { ...persisted };
+    if (contextUsage) candidate.contextUsage = contextUsage;
+    else delete candidate.contextUsage;
+    try {
+      saveInfo(candidate);
+    } catch (error) {
+      // Sampling is best-effort, including logging when the storage itself is unavailable.
+      try { live.logger.info("context", "failed to save context usage", { error: formatAgentError(error) }); } catch {}
+      return;
+    }
+    if (contextUsage) live.info.contextUsage = contextUsage;
+    else delete live.info.contextUsage;
+    live.info.updatedAt = candidate.updatedAt;
+  }
+
+  private requestContextRefresh(live: LiveAgent): void {
+    if (!this.canRefreshContext(live)) return;
+    live.contextRefreshDirty = true;
+    if (live.contextRefresh) return;
+    live.contextRefresh = (async () => {
+      try {
+        while (live.contextRefreshDirty && this.canRefreshContext(live)) {
+          live.contextRefreshDirty = false;
+          const epoch = live.contextEpoch;
+          const token = live.info.childProcess?.token;
+          try {
+            const stats = await this.sendCommand(live, { type: "get_session_stats" }, 1000);
+            if (this.canRefreshContext(live) && live.contextEpoch === epoch) {
+              this.saveContextUsage(live, stats?.contextUsage, token);
+            }
+          } catch {
+            // An unsuccessful RPC retains the last snapshot; only new activity retries it.
+          }
+        }
+      } finally {
+        delete live.contextRefresh;
+      }
+    })();
+  }
+
+  private invalidateContextUsage(live: LiveAgent): void {
+    if (!this.canRefreshContext(live)) return;
+    live.contextEpoch += 1;
+    const usage = normalizeContextUsage(live.info.contextUsage);
+    this.saveContextUsage(live, usage ? { contextWindow: usage.contextWindow, tokens: null, percent: null } : undefined, live.info.childProcess?.token);
+    this.requestContextRefresh(live);
   }
 
   private clearModelResponseTimer(live: LiveAgent): void {
@@ -1511,7 +1607,15 @@ export class AgentManager {
         return;
       }
     }
-    if (live.finalizedRun || live.expectedExit) return;
+    if (live.finalizedRun || live.expectedExit || live.processFinished) return;
+    if ((event.type === "compaction_end" && event.result)
+      || (event.type === "entry_appended" && (event.entry?.type === "context_edit" || event.entry?.type === "compaction"))) {
+      this.invalidateContextUsage(live);
+    } else if ((event.type === "message_end" && ["user", "assistant", "toolResult", "system", "custom"].includes(event.message?.role))
+      || event.type === "turn_end"
+      || (event.type === "entry_appended" && (event.entry?.type === "message" || event.entry?.type === "custom_message"))) {
+      this.requestContextRefresh(live);
+    }
     if (event.type === "agent_start") {
       live.info.status = "running";
       live.info.lastActivity = Date.now();
@@ -1569,7 +1673,7 @@ export class AgentManager {
       if (live.info.status === "interrupted" || live.finalizedRun) return;
       if (live.candidateError) this.markFailed(live, live.candidateError);
       else this.markCompleted(live);
-      void this.terminateProcess(live).catch((error) => {
+      void this.terminateProcess(live, true).catch((error) => {
         live.logger.info("hibernate", "failed to terminate settled child", { error: error instanceof Error ? error.message : String(error) });
       });
     }
@@ -1801,9 +1905,11 @@ export class AgentManager {
     }
     if (wasLive && (info.status === "starting" || info.status === "running")) {
       await this.sendCommand(live, { type: "steer", message });
-      info.lastTaskMessage = message;
-      info.lastActivity = Date.now();
-      saveInfo(info);
+      if (this.live.get(live.info.id) === live && !live.processFinished) {
+        live.info.lastTaskMessage = message;
+        live.info.lastActivity = Date.now();
+        saveInfo(live.info);
+      }
       return { delivery: "steer" };
     }
     try {
@@ -1817,17 +1923,16 @@ export class AgentManager {
 
   async interruptAgent(parentSessionId: string, target: string): Promise<{ previous_status: AgentRuntimeStatus }> {
     await this.reconciliation;
-    const info = this.getAgentInfo(target, parentSessionId);
-    const previous = info.status;
+    const persisted = this.getAgentInfo(target, parentSessionId);
+    const previous = persisted.status;
     if (previous !== "starting" && previous !== "running") return { previous_status: previous };
-    const live = this.live.get(info.id);
+    const live = this.live.get(persisted.id);
+    const info = live?.info ?? persisted;
     info.status = "interrupted";
     info.lastActivity = Date.now();
     saveInfo(info);
     this.notifyStatusChange(info);
     if (live) {
-      live.info.status = "interrupted";
-      live.info.lastActivity = info.lastActivity;
       live.finalizedRun = true;
       await this.terminateProcess(live);
     } else {
@@ -1856,14 +1961,23 @@ export class AgentManager {
     });
   }
 
-  private terminateProcess(live: LiveAgent): Promise<void> {
+  private terminateProcess(live: LiveAgent, captureContext = false): Promise<void> {
     this.clearModelResponseTimer(live);
     if (live.processFinished) return Promise.resolve();
     if (live.termination) return live.termination;
     live.termination = (async () => {
+      const token = live.info.childProcess?.token;
+      const epoch = live.contextEpoch;
       const abortRequest = this.sendCommand(live, { type: "abort" }, 1000);
+      // The final query may overlap an older background query, but uses its own RPC ID.
+      const contextRequest = captureContext
+        ? this.sendCommand(live, { type: "get_session_stats" }, 500).then((stats) => {
+          if (live.contextEpoch === epoch) this.saveContextUsage(live, stats?.contextUsage, token);
+        })
+        : Promise.resolve();
       live.expectedExit = true;
-      try { await abortRequest; } catch {}
+      live.contextRefreshDirty = false;
+      await Promise.allSettled([abortRequest, contextRequest]);
       try { live.proc.stdin.end(); } catch {}
       await Promise.race([live.exitPromise, delay(500)]);
       if (!live.processFinished) {
