@@ -1668,8 +1668,28 @@ export class AgentManager {
     // An asynchronous input hook can outlive the model run. This is operation tracking, not
     // a message queue: closing rejects new inputs and cleanup waits for the original ones.
     current.pendingSteers.add(steer);
-    void steer.then(() => current.pendingSteers.delete(steer), () => current.pendingSteers.delete(steer));
-    await boundedWait(steer, DEFAULT_STARTUP_TIMEOUT_MS, `Timed out waiting for agent ${info.canonicalName} steering acceptance.`, this.shutdownController.signal);
+    void steer.then(() => {
+      if (this.live.get(info.id) === current && current.cancellation.signal.aborted) {
+        // abort() does not retract an input that queues after cancellation. Discard only
+        // still-pending native messages; never rewrite messages already in the transcript.
+        try { session.clearQueue(); } catch (error) { this.reportError(current, error); }
+        this.requestAbort(current);
+      }
+      current.pendingSteers.delete(steer);
+    }, () => current.pendingSteers.delete(steer));
+    const timeout = new Error(`Timed out waiting for agent ${info.canonicalName} steering acceptance.`);
+    try {
+      await boundedWait(steer, DEFAULT_STARTUP_TIMEOUT_MS, timeout, this.shutdownController.signal);
+    } catch (error) {
+      // A timed-out input is still owned by the SDK. Cancel this run and keep its JSONL
+      // locked until pendingSteers exits; ordinary input rejection must not abort the run.
+      if (error === timeout && this.live.get(info.id) === current && !current.finalizedRun) {
+        this.requestCancellation(current, timeout);
+        try { this.markFailed(current, timeout.message); } catch (saveError) { this.reportError(current, saveError); }
+        finally { this.scheduleTermination(current); }
+      }
+      throw error;
+    }
     throwIfAborted(this.shutdownController.signal);
     if (this.live.get(info.id) !== current || current.closing || current.finalizedRun || !session.isStreaming) {
       throw new Error(`Agent ${info.canonicalName} ended while steering input was being processed; delivery cannot be confirmed. Retry after cleanup.`);

@@ -793,6 +793,116 @@ describe("SDK lifecycle and cancellation races", () => {
     } finally { response.resolve(); input.resolve(); await manager.shutdown(); }
   });
 
+  test.each([false, true])("steer timeout cancels the run and owns late input until cleanup (ignoreAbort=%s)", async (ignoreAbort) => {
+    const response = deferred();
+    const input = deferred();
+    fixture = configureCoreFixture({ responseGate: response.promise, ignoreAbort, input: async (event) => {
+      if (event.streamingBehavior === "steer") await input.promise;
+    } });
+    const parent = "steer-timeout-" + randomUUID();
+    const completions: any[] = [];
+    const manager = new AgentManager({ onUnclaimedCompletion: (event) => completions.push(event), onError() {} });
+    let timers: ReturnType<typeof spyOn> | undefined;
+    try {
+      await manager.spawnAgent(spawnParams(parent, "worker", "hold initial"));
+      await waitUntil(() => fixture.instances[0].activeStreams === 1);
+      const info = manager.getAgentInfo("worker", parent);
+      const live = manager["live"].get(info.id)!;
+      const original = globalThis.setTimeout;
+      timers = spyOn(globalThis, "setTimeout").mockImplementation(((callback: any, delay: number, ...args: any[]) =>
+        original(callback, delay === 15000 || delay === 2000 ? 100 : delay, ...args)) as typeof setTimeout);
+      await expect(manager.sendMessage(parent, "worker", "must not execute late")).rejects.toThrow(/steering acceptance/);
+      expect(live.closing).toBe(true);
+      expect(live.cancellation.signal.aborted).toBe(true);
+      expect(live.pendingSteers.size).toBe(1);
+      expect(manager.getAgentInfo("worker", parent).status).toBe("failed");
+      expect(completions).toHaveLength(1);
+      expect(completions[0].error).toMatch(/steering acceptance/);
+      expect(fs.existsSync(activeMarker(info.id))).toBe(true);
+      expect(fixture.instances[0].shutdowns).toBe(0);
+      await expect(manager.sendMessage(parent, "worker", "must not reopen")).rejects.toThrow(/closing/);
+      expect(fixture.instances).toHaveLength(1);
+      // Even after input returns, non-cooperative model work still owns the file.
+      input.resolve();
+      await waitUntil(() => live.pendingSteers.size === 0);
+      if (ignoreAbort) {
+        expect(manager["live"].get(info.id)).toBe(live);
+        expect(fixture.instances[0].shutdowns).toBe(0);
+      }
+      response.resolve();
+      await released(manager, info);
+      expect(fixture.instances[0].requests.map((request) => request.text)).toEqual(["hold initial"]);
+      expect(fixture.instances[0].shutdowns).toBe(1);
+      expect(completions).toHaveLength(1);
+      expect(manager.getAgentInfo("worker", parent).status).toBe("failed");
+      expect(fs.existsSync(activeMarker(info.id))).toBe(false);
+      expect(sessionMessages(info).some((message) => JSON.stringify(message).includes("must not execute late"))).toBe(false);
+      timers.mockRestore();
+      await manager.sendMessage(parent, "worker", "clean recovery");
+      await released(manager, info);
+      expect(manager.getAgentInfo("worker", parent).sessionFile).toBe(info.sessionFile);
+      expect(manager.readAgentResponse("worker", parent).finalResponse).toBe("response:clean recovery");
+      expect(fixture.instances.map((instance) => instance.shutdowns)).toEqual([1, 1]);
+    } finally { timers?.mockRestore(); input.resolve(); response.resolve(); await manager.shutdown(); }
+  });
+
+  test("ordinary steer rejection preserves the active run, even with timeout-like error text", async () => {
+    const response = deferred();
+    fixture = configureCoreFixture({ responseGate: response.promise });
+    const parent = "steer-rejection-" + randomUUID();
+    const manager = new AgentManager();
+    let steer: ReturnType<typeof spyOn> | undefined;
+    try {
+      await manager.spawnAgent(spawnParams(parent, "worker", "hold original"));
+      const info = manager.getAgentInfo("worker", parent);
+      const live = manager["live"].get(info.id)!;
+      const rejection = new Error("Timed out waiting for agent /worker steering acceptance.");
+      steer = spyOn(live.session!, "steer").mockRejectedValue(rejection);
+      await expect(manager.sendMessage(parent, "worker", "rejected input")).rejects.toBe(rejection);
+      expect(live.cancellation.signal.aborted).toBe(false);
+      expect(live.closing).toBe(false);
+      expect(live.pendingSteers.size).toBe(0);
+      expect(manager.getAgentInfo("worker", parent)).toMatchObject({ status: "running", lastTaskMessage: "hold original" });
+      steer.mockRestore();
+      response.resolve();
+      await released(manager, info);
+      expect(manager.readAgentResponse("worker", parent).finalResponse).toBe("response:hold original");
+    } finally { steer?.mockRestore(); response.resolve(); await manager.shutdown(); }
+  });
+
+  test.each(["completed", "interrupted"])("a later steer timeout cannot replace an already %s run", async (status) => {
+    const response = deferred();
+    const input = deferred();
+    fixture = configureCoreFixture({ responseGate: response.promise, input: async (event) => {
+      if (event.streamingBehavior === "steer") await input.promise;
+    } });
+    const parent = "steer-finalized-" + status + "-" + randomUUID();
+    const manager = new AgentManager({ onError() {} });
+    let timers: ReturnType<typeof spyOn> | undefined;
+    let interruption: Promise<unknown> | undefined;
+    try {
+      await manager.spawnAgent(spawnParams(parent, "worker", "hold original"));
+      const info = manager.getAgentInfo("worker", parent);
+      const original = globalThis.setTimeout;
+      timers = spyOn(globalThis, "setTimeout").mockImplementation(((callback: any, delay: number, ...args: any[]) =>
+        original(callback, delay === 15000 ? 150 : delay, ...args)) as typeof setTimeout);
+      const pending = manager.sendMessage(parent, "worker", "late input").catch((error) => error);
+      await waitUntil(() => fixture.instances[0].inputs.length === 2);
+      if (status === "completed") response.resolve();
+      else interruption = manager.interruptAgent(parent, "worker");
+      await waitUntil(() => manager.getAgentInfo("worker", parent).status === status);
+      expect((await pending).message).toMatch(/steering acceptance/);
+      expect(manager.getAgentInfo("worker", parent).status).toBe(status);
+      input.resolve();
+      response.resolve();
+      await interruption;
+      await released(manager, info);
+      expect(manager.getAgentInfo("worker", parent).status).toBe(status);
+      expect(fixture.instances[0].requests).toHaveLength(1);
+      expect(fixture.instances[0].shutdowns).toBe(1);
+    } finally { timers?.mockRestore(); input.resolve(); response.resolve(); await interruption; await manager.shutdown(); }
+  });
+
   test.each(["startup", "input"])("ctx.shutdown during %s cancels the child without stopping its parent", async (phase) => {
     fixture = configureCoreFixture({ shutdownAtStart: phase === "startup" });
     const parent = "extension-shutdown-" + phase + "-" + randomUUID();

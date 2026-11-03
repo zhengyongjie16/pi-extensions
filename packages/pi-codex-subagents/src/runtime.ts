@@ -72,7 +72,7 @@ export async function createChildSession(options: ChildSessionOptions): Promise<
   if (!systemPrompt.replace(/^\uFEFF/, "").trim()) throw new Error(`System prompt is empty: ${systemPromptPath}`);
 
   const agentDir = getAgentDir();
-  // SDK 1.4.0 defaults projectTrusted to true. Start closed before reading project settings.
+  // SDK 1.5.0 defaults projectTrusted to true. Start closed before reading project settings.
   const settingsManager = SettingsManager.create(cwd, agentDir, { projectTrusted: false });
   // Public native trust-store/settings primitives implement Pi's headless fallback without
   // importing its private CLI resolver, prompting, or persisting a new trust decision.
@@ -151,7 +151,7 @@ export async function createChildSession(options: ChildSessionOptions): Promise<
 }
 
 /**
- * Pi 1.4.0's RPC acceptance hook is exported but marked internal. Keep the version-sensitive
+ * Pi 1.5.0's RPC acceptance hook is exported but marked internal. Keep the version-sensitive
  * call here; the caller tracks this ORIGINAL promise and chains waitForIdle() for completion.
  */
 export function promptChildSession(

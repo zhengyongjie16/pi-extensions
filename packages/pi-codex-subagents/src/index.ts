@@ -112,9 +112,10 @@ export default async function index_ (pi: ExtensionAPI) {
 
   type SpawnModel = { provider: string; modelId: string };
 
-  const exactPair = (pattern: string): SpawnModel | undefined => {
+  const exactPair = (pattern: string, available: Set<string>): SpawnModel | undefined => {
     const colon = pattern.lastIndexOf(":");
-    const reference = colon > 0 && (THINKING_LEVELS as readonly string[]).includes(pattern.slice(colon + 1)) ? pattern.slice(0, colon) : pattern;
+    // A registered ID wins over the legacy model:thinking shorthand.
+    const reference = !available.has(pattern) && colon > 0 && (THINKING_LEVELS as readonly string[]).includes(pattern.slice(colon + 1)) ? pattern.slice(0, colon) : pattern;
     const slash = reference.indexOf("/");
     if (slash <= 0 || /[*?[\]]/.test(reference)) return undefined;
     return { provider: reference.slice(0, slash), modelId: reference.slice(slash + 1) };
@@ -125,10 +126,10 @@ export default async function index_ (pi: ExtensionAPI) {
   const resolveSpawnModels = (ctx: any) => {
     const config = loadSubagentConfig();
     const models = new Map<string, SpawnModel>();
-    const available = new Set(ctx.modelRegistry.getAvailable().map((model: any) => `${model.provider}/${model.id}`));
+    const available = new Set<string>(ctx.modelRegistry.getAvailable().map((model: any) => `${model.provider}/${model.id}`));
     const unavailable: string[] = [];
     for (const entry of config.models ?? []) {
-      const pair = exactPair(entry);
+      const pair = exactPair(entry, available);
       if (pair && available.has(`${pair.provider}/${pair.modelId}`)) models.set(`${pair.provider}/${pair.modelId}`, pair);
       else unavailable.push(entry);
     }
@@ -269,8 +270,9 @@ ${cachedSkills.length ? cachedSkills.map((skill) => `- \`${skill.name}\` — ${s
         skills: Type.Optional(Type.Array(Type.String(), { description: "Additional skill names from the loaded parent skills listed in this tool description." })),
         ...(spawnModels.size
           ? {
-              model: Type.Optional(StringEnum([...spawnModels.keys()], { description: "Optional model for this one task, for example an independent review by another vendor. Defaults to the template model, otherwise the parent model." })),
-              thinking: Type.Optional(StringEnum(THINKING_LEVELS, { description: "Optional thinking level. Defaults to the template level, otherwise the parent level." })),
+              // Pi 1.5 returns plain enum schemas; Unsafe keeps TypeBox Optional metadata non-enumerable.
+              model: Type.Optional(Type.Unsafe<string>(StringEnum([...spawnModels.keys()], { description: "Optional model for this one task, for example an independent review by another vendor. Defaults to the template model, otherwise the parent model." }))),
+              thinking: Type.Optional(Type.Unsafe<ThinkingLevel>(StringEnum(THINKING_LEVELS, { description: "Optional thinking level. Defaults to the template level, otherwise the parent level." }))),
             }
           : {}),
       });
@@ -286,6 +288,10 @@ ${cachedSkills.length ? cachedSkills.map((skill) => `- \`${skill.name}\` — ${s
       if (params.model && !model) throw new Error(`spawn_agent failed: model "${params.model}" is not in the configured spawn models: ${[...spawnModels.keys()].join(", ") || "none"}`);
       if (model && !ctx.modelRegistry.getAvailable().some((entry: any) => entry.provider === model.provider && entry.id === model.modelId)) {
         throw new Error(`spawn_agent failed: model "${params.model}" is not currently available.`);
+      }
+      if (params.thinking !== undefined) {
+        if (!spawnModels.size) throw new Error("spawn_agent failed: thinking overrides require configured spawn models.");
+        if (!THINKING_LEVELS.includes(params.thinking)) throw new Error(`spawn_agent failed: thinking must be one of: ${THINKING_LEVELS.join(", ")}`);
       }
       try {
         const manager = ensureManager(ctx);

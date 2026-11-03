@@ -157,6 +157,45 @@ test("preserves the seven schemas, dynamic routing/skills, tool arguments, and r
   `);
 });
 
+test("prefers exact registered model IDs before legacy thinking suffixes without changing the allowlist union", () => {
+  probe(hostFixture + String.raw`
+    const f = host();
+    const available = [
+      { provider: "test", id: "fake" }, { provider: "test", id: "fake:high" },
+      { provider: "test", id: "only:low" }, { provider: "test", id: "accounts/team/model:high" },
+      { provider: "other", id: "scoped:max" },
+    ];
+    f.ctx.modelRegistry.getAvailable = () => available;
+    f.ctx.scopedModels = [{ model: available[1] }, { model: available[4] }];
+    const config = path.join(f.ctx.cwd, "pi-codex-subagents", "config.json");
+    fs.mkdirSync(path.dirname(config), { recursive: true });
+    fs.writeFileSync(config, JSON.stringify({
+      models: ["test/fake:high", "test/only:low", "test/fake:medium", "test/accounts/team/model:high", "test/fake:unknown", "fake", "test/*:high"],
+      modelsFromEnabledModels: true,
+    }));
+    await extension(f.pi);
+    await f.emit("session_start");
+    try {
+      const models = ["test/fake:high", "test/only:low", "test/fake", "test/accounts/team/model:high", "other/scoped:max"];
+      assert.deepEqual(f.tools.get("spawn_agent").parameters.properties.model.enum, models);
+      assert.deepEqual(f.notifications, [["spawn_agent models not available: test/fake:unknown, fake, test/*:high", "warning"]]);
+      let spawned;
+      AgentManager.prototype.spawnAgent = async params => { spawned = params; return { task_name: "/task" }; };
+      AgentManager.prototype.getAgentInfo = () => ({ ...spawned.model, thinking: spawned.inheritedThinking });
+      for (const model of models) {
+        await f.call("spawn_agent", { task_name: "task", message: "work", model });
+        assert.equal(spawned.model.provider + "/" + spawned.model.modelId, model);
+        assert.equal(spawned.thinking, undefined, "a model suffix must not override inherited thinking");
+      }
+      // Even when there is no unsuffixed model, the full registered ID is usable.
+      available.splice(0, 1);
+      fs.writeFileSync(config, JSON.stringify({ models: ["test/fake:high"] }));
+      await f.emit("session_start");
+      assert.deepEqual(f.tools.get("spawn_agent").parameters.properties.model.enum, ["test/fake:high"]);
+    } finally { await f.emit("session_shutdown", { reason: "quit" }); }
+  `);
+});
+
 test("forwards only current same-cwd effective trust and reports errors without changing control flow", () => {
   probe(hostFixture + String.raw`
     const f = host();
@@ -300,6 +339,112 @@ const crossHostObserver = String.raw`
     }
   });
 `;
+
+test.each(runtimes)("validates dynamic spawn schemas and enforces thinking overrides with real SDK children (%s)", (_name, executable) => {
+  probe(String.raw`
+    import assert from "node:assert/strict";
+    import * as fs from "node:fs";
+    import * as path from "node:path";
+    process.env.PI_OFFLINE = "1";
+    const { createAgentSessionServices, createAgentSessionFromServices, SessionManager, SettingsManager } = await import(${JSON.stringify(sdkUrl)});
+    const { validateToolArguments } = await import(${JSON.stringify(import.meta.resolve("@earendil-works/pi-ai"))});
+    const fixturePath = ${JSON.stringify(path.join(packageDir, "tests", "fixtures", "core-sdk-fixture.ts"))};
+    const { configureCoreFixture } = await import(${JSON.stringify(pathToFileURL(path.join(packageDir, "tests", "fixtures", "core-sdk-fixture.ts")).href)});
+    const nativeThinking = [];
+    const fixture = configureCoreFixture({
+      routes: [["test", "fake"], ["test", "fake:high"], ["template-provider", "template-model"]],
+      onStart: pi => { nativeThinking.push(pi.getThinkingLevel()); },
+    });
+    const agentDir = process.env.PI_CODING_AGENT_DIR;
+    const settings = { compaction: { enabled: false }, retry: { enabled: false }, cacheWarming: "off" };
+    fs.writeFileSync(path.join(agentDir, "settings.json"), JSON.stringify(settings));
+    const config = path.join(agentDir, "pi-codex-subagents", "config.json");
+    const templates = path.join(path.dirname(config), "agents");
+    fs.mkdirSync(templates, { recursive: true });
+    fs.writeFileSync(path.join(templates, "routed.md"), "---\nname: routed\nprovider: template-provider\nmodel: template-model\nthinking: medium\n---\n");
+    const writeConfig = models => fs.writeFileSync(config, JSON.stringify({ defaults: { extensions: [fixturePath] }, ...(models ? { models } : {}) }));
+    writeConfig();
+    const settingsManager = SettingsManager.inMemory(settings);
+    settingsManager.setProjectTrusted(true);
+    const services = await createAgentSessionServices({
+      cwd: agentDir, agentDir, settingsManager, resourceLoaderOptions: {
+        noExtensions: true, noSkills: true, noPromptTemplates: true, noThemes: true, noContextFiles: true,
+        additionalExtensionPaths: [process.argv[2], fixturePath],
+      },
+    });
+    assert.deepEqual(services.resourceLoader.getExtensions().errors, []);
+    const model = (await services.modelRuntime.getAvailable("test")).find(model => model.id === "fake");
+    assert.ok(model);
+    const { session } = await createAgentSessionFromServices({ services, model, thinkingLevel: "off", sessionManager: SessionManager.inMemory(agentDir) });
+    const errors = [];
+    try {
+      await session.bindExtensions({ mode: "print", onError: error => errors.push(error) });
+      const ctx = session.extensionRunner.createContext();
+      const spawnTool = () => session.getToolDefinition("spawn_agent");
+      const validate = args => validateToolArguments(spawnTool(), { type: "toolCall", id: "routing", name: "spawn_agent", arguments: args });
+      const execute = args => spawnTool().execute("routing", args, undefined, undefined, ctx);
+      const spawn = async (task_name, extra = {}) => {
+        const result = await execute(validate({ task_name, message: "work", ...extra }));
+        const child = fixture.instances.at(-1);
+        assert.equal(child.ctx.model.provider, result.details.provider);
+        assert.equal(child.ctx.model.id, result.details.modelId);
+        assert.equal(nativeThinking.at(-1), result.details.thinking);
+        const waited = await session.getToolDefinition("wait_agent").execute("wait", { targets: [task_name] }, undefined, undefined, ctx);
+        assert.equal(JSON.parse(waited.content[0].text).event.status, "completed");
+        return result.details;
+      };
+      assert.equal(spawnTool().parameters.properties.thinking, undefined);
+      const hidden = validate({ task_name: "hidden", message: "work", thinking: "high" });
+      assert.equal(hidden.thinking, "high", "native validation permits this undeclared extra property");
+      const initialChildren = fixture.instances.length;
+      await assert.rejects(execute(hidden), /thinking.*configured spawn models/);
+      assert.equal(fixture.instances.length, initialChildren, "rejection must precede child creation");
+      assert.equal((await spawn("inherited")).thinking, "off");
+      assert.equal((await spawn("template-inherited", { agent_type: "routed" })).thinking, "medium");
+
+      writeConfig(["test/fake", "test/fake:high"]);
+      await session.extensionRunner.emit({ type: "session_start", reason: "reload" });
+      const schema = JSON.parse(JSON.stringify(spawnTool().parameters));
+      assert.deepEqual(schema.required, ["task_name", "message"]);
+      assert.deepEqual(schema.properties.model, { type: "string", enum: ["test/fake", "test/fake:high"], description: schema.properties.model.description });
+      assert.deepEqual(schema.properties.thinking, { type: "string", enum: ["off", "minimal", "low", "medium", "high", "xhigh", "max"], description: schema.properties.thinking.description });
+      assert.ok(!JSON.stringify(schema).includes("\"~"), "TypeBox internals must not leak into the provider-facing schema");
+      assert.equal(validate({ task_name: "optional", message: "work" }).thinking, undefined);
+      for (const thinking of schema.properties.thinking.enum) assert.equal(validate({ task_name: "valid", message: "work", thinking }).thinking, thinking);
+      const beforeInvalid = fixture.instances.length;
+      for (const thinking of ["invalid", "HIGH", "", null, false, 1, [], {}]) {
+        await assert.rejects(execute({ task_name: "invalid", message: "work", thinking }), /thinking.*(one of|level)/);
+      }
+      for (const thinking of ["invalid", "HIGH", "", false, 1, [], {}]) {
+        assert.throws(() => validate({ task_name: "invalid", message: "work", thinking }), /thinking/);
+      }
+      assert.throws(() => validate({ task_name: "invalid-model", message: "work", model: "test/not-allowed" }), /model/);
+      assert.equal(fixture.instances.length, beforeInvalid);
+      assert.equal((await spawn("ordinary", { model: "test/fake" })).modelId, "fake");
+      const colon = await spawn("colon", { model: "test/fake:high" });
+      assert.equal(colon.modelId, "fake:high");
+      assert.equal(colon.thinking, "off", "the exact ID suffix is not a thinking override");
+      const overridden = await spawn("caller-priority", { agent_type: "routed", model: "test/fake:high", thinking: "high" });
+      assert.equal(overridden.provider, "test");
+      assert.equal(overridden.modelId, "fake:high");
+      assert.equal(overridden.thinking, "high");
+      assert.equal((await spawn("thinking-only", { thinking: "low" })).thinking, "low");
+      assert.equal((await spawn("template-priority", { model: "test/fake", agent_type: "routed" })).thinking, "medium");
+
+      const stale = validate({ task_name: "stale", message: "work", thinking: "high" });
+      writeConfig(["missing/model"]);
+      await session.extensionRunner.emit({ type: "session_start", reason: "reload" });
+      assert.equal(spawnTool().parameters.properties.model, undefined);
+      assert.equal(spawnTool().parameters.properties.thinking, undefined);
+      await assert.rejects(execute(stale), /thinking.*configured spawn models/);
+      assert.equal((await spawn("inherited-again")).thinking, "off");
+      assert.deepEqual(errors, []);
+    } finally {
+      try { await session.extensionRunner.emit({ type: "session_shutdown", reason: "quit" }); }
+      finally { session.dispose(); }
+    }
+  `, executable);
+});
 
 test.each(runtimes)("keeps mid-run sync and Unicode deltas readable from a separate %s process", (_name, executable) => {
   probe(String.raw`
@@ -674,7 +819,7 @@ test("packs runtime.ts without an SDK copy and loads the extracted package throu
     const manifest = JSON.parse(fs.readFileSync(path.join(temporary, "package", "package.json"), "utf8"));
     expect(manifest.dependencies).toBeUndefined();
     expect(manifest.bundledDependencies).toBeUndefined();
-    for (const name of ["pi-ai", "pi-coding-agent", "pi-tui"]) expect(manifest.peerDependencies["@earendil-works/" + name]).toBe("1.4.0");
+    for (const name of ["pi-ai", "pi-coding-agent", "pi-tui"]) expect(manifest.peerDependencies["@earendil-works/" + name]).toBe("1.5.0");
     expect(manifest.pi.extensions).toEqual(["./src/index.ts"]);
     const packedEntry = path.join(temporary, "package", "src", "index.ts");
     probe(loaderSmoke, process.execPath, packedEntry);

@@ -2,7 +2,7 @@
 
 Codex-shaped, session-scoped subagents for [Pi](https://github.com/earendil-works/pi). Run fresh-context SDK sessions inside the parent Pi process, receive their final responses automatically, steer active work, and inspect sessions in the existing live overlay. No separate Pi agent engine or child TUI is started.
 
-Requires **Pi 1.4.0** and Node.js 22.19 or newer. The supported Pi version is pinned because task acceptance uses `PromptOptions.preflightResult`, an exported but **internal** SDK hook verified against 1.4.0. Later versions require contract checks before widening support. Pi supplies the SDK and UI packages; this package does not bundle another SDK copy.
+Requires **Pi 1.5.0** and Node.js 22.19 or newer. The supported Pi version is pinned because task acceptance uses `PromptOptions.preflightResult`, an exported but **internal** SDK hook verified against 1.5.0. Later versions require contract checks before widening support. Pi supplies the SDK and UI packages; this package does not bundle another SDK copy.
 
 ## Install
 
@@ -145,7 +145,7 @@ The arguments are offered only when at least one allowed model is available, and
 
 The list is resolved when a session starts: `models` entries are filtered to what is currently available, unavailable entries are reported as a warning notification, and the scoped models are merged in. Editing the configuration or the Pi setting takes effect when the next session starts, matching the `storageDir` and `retentionDays` behavior above. If a provider drops out mid-session, `spawn_agent` refuses that model at spawn time instead of serving a stale route.
 
-Every route must use exact registered provider/model IDs, including any slashes in the model ID. Fuzzy names and unregistered custom IDs are not accepted. Before any task prompt, the child must advertise the exact resolved pair in its available model registry and report that exact selected model. Missing or mismatched models fail startup and clean up the child session; there is no fallback or provider search. Validation uses the child's registry, not the parent's, so explicitly loaded provider extensions can register models there.
+Every route must use exact registered provider/model IDs, including any slashes in the model ID. A complete registered ID ending in `:high`, `:low`, or another thinking-level suffix takes precedence over suffix parsing. For compatibility, a trailing thinking suffix in `models` is ignored only when the complete ID is unavailable and the unsuffixed ID is an exact available match. Fuzzy names and unregistered custom IDs are not accepted. Before any task prompt, the child must advertise the exact resolved pair in its available model registry and report that exact selected model. Missing or mismatched models fail startup and clean up the child session; there is no fallback or provider search. Validation uses the child's registry, not the parent's, so explicitly loaded provider extensions can register models there.
 
 The resolved provider/model pair is saved at spawn. `send_message` resumptions reuse and revalidate that saved pair, even if the parent model or template has since changed. These are local SDK availability/selection checks, not model-request probes; selection does not change the parent's configured default model. Registration cannot guarantee that a remote backend actually serves an advertised model; backend rejection still occurs at the first request.
 
@@ -173,11 +173,13 @@ Historical and sync-final results follow native transcript replay without live-o
 
 After a turn completes, fails, or is interrupted, the extension releases the SDK session once initialization and submitted work have actually exited, explicitly sends child `session_shutdown`, and disposes the session. `send_message` then opens that agent's original JSONL in a new SDK session. Its saved route/resource selections and history are retained; prompt files and ordinary settings are reread. Messages during startup are rejected rather than buffered. While cleanup is still pending, reopening the same JSONL is refused if the bounded cleanup wait expires. A timeout is reported, not treated as successful resource release.
 
+A steering acceptance timeout fails the current run and requests cancellation instead of leaving the timed-out input running silently. The session file stays owned until that input and the run exit; late input clears still-pending native messages after cancellation, without rewriting the transcript. Ordinary rejected steering input does not cancel the run, and an already completed/interrupted result is not replaced by a later timeout. Cancellation does not undo extension side effects or input already consumed by the SDK.
+
 `interrupt_agent` and response timeouts use **cooperative cancellation**. There is no independent force-kill, process isolation, or security sandbox. Non-cooperative initialization, input hooks, tools, or extension code may keep running or retain resources after a business timeout. A blocked event loop can also stall parent TUI updates and timers; a child's crash, OOM, `process.exit()`, or global module mutation can affect the whole Pi host. Sessions in the same cwd share the worktree, normal credentials, and filesystem access; no worktree or OS isolation is added. External processes started by tools/extensions still need their normal cleanup.
 
 Child extensions bind in headless `print` mode (`hasUI: false`), without a parent UI bridge. Prompt/steer input keeps the `rpc` source label only as compatible input metadata, not as an execution backend. Extensions that require RPC-mode dialogs, assume `process.cwd()` is the child directory, use global state, or end the process are not guaranteed equivalent. The parent widget, browser, and peek overlay remain interactive and unchanged.
 
-A new loader is not a fresh module environment: Pi 1.4.0 caches extension factories by cwd/path. Repeated resumptions can reuse module code and module-level state. After changing extension code, use the host's `/reload` or restart; this package does not clear private SDK caches or promise module isolation. Use only extensions you trust and validate their headless behavior.
+A new loader is not a fresh module environment: Pi 1.5.0 caches extension factories by cwd/path. Repeated resumptions can reuse module code and module-level state. After changing extension code, use the host's `/reload` or restart; this package does not clear private SDK caches or promise module isolation. Use only extensions you trust and validate their headless behavior.
 
 ## Upgrading from the RPC version
 
@@ -191,10 +193,11 @@ Automatic completions, wait tools, and response tools follow Pi's standard 50 KB
 
 ## Development checks
 
-The root development dependencies and lockfile pin the Pi packages to 1.4.0. After installing them from the repository root, run from this package directory (the tarball smoke test also needs `npm` and `tar` on PATH):
+The root development dependencies and lockfile pin the Pi packages to 1.5.0. The isolated SDK contract suite asserts that version to catch stale development installs. After installing them from the repository root, run from this package directory (the tarball smoke test also needs `npm` and `tar` on PATH):
 
 ```bash
-bun test ./core.test.ts ./runtime.test.ts ./peek.test.ts ./host-integration.test.ts --timeout 60000
+bun test ./tests/core.test.ts ./tests/runtime.test.ts ./tests/peek.test.ts ./tests/host-integration.test.ts --timeout 60000
+node --test ./tests/runtime.test.ts
 ```
 
 Automated checks cover controlled SDK behavior, storage/observer contracts, native-renderer comparisons, and host integration. `host-integration.test.ts` checks the seven public schemas, dynamic trust/error forwarding, lifecycle shutdown reporting, the real Pi extension file loader, and a packed-tarball loader smoke test. On Bun and Node, a controlled provider issues a real parent tool call that invokes the seven tools through native nested-tool validation/hooks while independent parent work remains active. The test checks persisted nested-call records and repeated child session disposal, subscriptions, observed timers, sockets, and activity markers. Tests use temporary agent directories and controlled responses rather than external model requests.

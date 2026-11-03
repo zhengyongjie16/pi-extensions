@@ -14,7 +14,7 @@ const testFile = fileURLToPath(import.meta.url);
 // Isolate SDK contracts from sibling suites' environment changes and shared-method spies:
 // both Bun and Node must load the REAL SDK, with no host credentials or network requests.
 if (process.env.PI_SUBAGENT_SDK_CONTRACT_CHILD !== "1") {
-  test("real Pi SDK 1.4 offline contracts (isolated from core module mocks)", () => {
+  test("real Pi SDK 1.5 offline contracts (isolated from core module mocks)", () => {
     const args = process.versions.bun ? ["test", testFile, "--timeout", "60000"] : ["--test", testFile];
     const env: NodeJS.ProcessEnv = { ...process.env, PI_SUBAGENT_SDK_CONTRACT_CHILD: "1" };
     // Node forwards this marker to children; retaining it makes --test skip the nested suite.
@@ -30,6 +30,10 @@ if (process.env.PI_SUBAGENT_SDK_CONTRACT_CHILD !== "1") {
     console.log(output.trim());
   });
 } else {
+  test("contracts run against the supported Pi SDK 1.5.0, not a stale development dependency", () => {
+    const manifest = new URL("../package.json", import.meta.resolve("@earendil-works/pi-coding-agent"));
+    assert.equal(JSON.parse(fs.readFileSync(manifest, "utf8")).version, "1.5.0");
+  });
   const originalFetch = globalThis.fetch;
   const fetchAttempts: string[] = [];
   globalThis.fetch = (async (input: unknown) => {
