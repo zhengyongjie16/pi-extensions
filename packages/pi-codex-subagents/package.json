@@ -26,9 +26,9 @@
     "node": ">=22.19.0"
   },
   "peerDependencies": {
-    "@earendil-works/pi-ai": ">=1.4.0",
-    "@earendil-works/pi-coding-agent": ">=1.4.0",
-    "@earendil-works/pi-tui": ">=1.4.0",
+    "@earendil-works/pi-ai": "1.4.0",
+    "@earendil-works/pi-coding-agent": "1.4.0",
+    "@earendil-works/pi-tui": "1.4.0",
     "typebox": "*"
   },
   "publishConfig": {
@@ -36,13 +36,14 @@
   },
   "pi": {
     "extensions": [
-      "./index.ts"
+      "./src/index.ts"
     ]
   },
   "files": [
-    "index.ts",
-    "core.ts",
-    "peek.ts",
+    "src/index.ts",
+    "src/core.ts",
+    "src/runtime.ts",
+    "src/peek.ts",
     "README.md",
     "LICENSE"
   ]

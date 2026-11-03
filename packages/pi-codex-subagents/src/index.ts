@@ -1,3 +1,4 @@
+import { isAbsolute, relative, sep } from "node:path";
 import type { ExtensionAPI, Theme, ToolRenderers } from "@earendil-works/pi-coding-agent";
 import {
   createCodemodeExtension,
@@ -13,6 +14,7 @@ import { Text, matchesKey, truncateToWidth, visibleWidth, type KeyId } from "@ea
 import {
   AgentManager,
   getAgentDefinitionsDescription,
+  getRunsDir,
   loadSubagentConfig,
   THINKING_LEVELS,
   type AgentCompletionEvent,
@@ -190,15 +192,48 @@ export default async function index_ (pi: ExtensionAPI) {
     }, { deliverAs: "steer", triggerTurn: true });
   };
 
-  const manager = new AgentManager({
-    onActivityChange: (event) => {
-      if (!isCurrentSession(event.parentSessionId)) return;
-      if (event.active) activeAgents.add(event.agentName);
-      else activeAgents.delete(event.agentName);
-      refreshAgentWidget();
-    },
-    onUnclaimedCompletion: deliverCompletion,
-  });
+  const reportError = (error: unknown, ctx = activeContext) => {
+    const errors = error instanceof AggregateError ? [error, ...error.errors] : [error];
+    const message = `[subagents] ${errors.map((entry) => entry instanceof Error ? entry.message : String(entry)).join("\n")}`;
+    try {
+      if (ctx?.hasUI && typeof ctx.ui?.notify === "function") {
+        ctx.ui.notify(message, "error");
+        return;
+      }
+    } catch {} // A stale or failing UI must not interrupt cleanup.
+    try { console.error(message); } catch {}
+  };
+
+  let manager: AgentManager | undefined;
+  const ensureManager = (ctx: any): AgentManager => {
+    activeContext = ctx;
+    if (manager) return manager;
+    manager = new AgentManager({
+      // Read the effective decision again on every creation/resume; never persist trust.
+      projectTrusted: (cwd) => {
+        if (typeof activeContext?.cwd !== "string" || relative(cwd, activeContext.cwd) !== "") return undefined;
+        const trusted = activeContext.isProjectTrusted?.();
+        return typeof trusted === "boolean" ? trusted : undefined;
+      },
+      onError: reportError,
+      onActivityChange: (event) => {
+        if (!isCurrentSession(event.parentSessionId)) return;
+        if (event.active) activeAgents.add(event.agentName);
+        else activeAgents.delete(event.agentName);
+        refreshAgentWidget();
+      },
+      onUnclaimedCompletion: deliverCompletion,
+    });
+    // Also cover a parent using a custom native session directory.
+    const sessionDir = ctx.sessionManager.getSessionDir?.();
+    if (typeof sessionDir === "string") {
+      const storage = getRunsDir();
+      const overlaps = [relative(sessionDir, storage), relative(storage, sessionDir)].some((path) =>
+        !isAbsolute(path) && path.split(sep)[0] !== "..");
+      if (overlaps) reportError(new Error(`Subagent storageDir overlaps the parent session directory (${sessionDir}); child sessions may appear in /resume.`));
+    }
+    return manager;
+  };
 
   pi.registerMessageRenderer(completionMessageType, (message: any, { expanded }: any, theme: Theme) => {
     const status = message.details?.status;
@@ -253,6 +288,7 @@ ${cachedSkills.length ? cachedSkills.map((skill) => `- \`${skill.name}\` — ${s
         throw new Error(`spawn_agent failed: model "${params.model}" is not currently available.`);
       }
       try {
+        const manager = ensureManager(ctx);
         const result = await manager.spawnAgent({
           task_name: params.task_name,
           message: params.message,
@@ -299,6 +335,7 @@ ${cachedSkills.length ? cachedSkills.map((skill) => `- \`${skill.name}\` — ${s
     try { spawnModels = resolveSpawnModels(ctx); }
     catch (error: any) { ctx.ui?.notify?.(`spawn_agent model resolution failed, keeping the previous list: ${error?.message || error}`, "warning"); }
     pi.registerTool(spawnAgentTool);
+    const manager = ensureManager(ctx);
     await manager.ready();
     if (activeContext !== ctx) return;
     for (const entry of manager.listAgents(undefined, parentSessionId(ctx))) {
@@ -322,11 +359,16 @@ ${cachedSkills.length ? cachedSkills.map((skill) => `- \`${skill.name}\` — ${s
     }
   });
 
-  pi.on("session_shutdown", async () => {
-    if (activeContext?.mode === "tui") activeContext.ui.setWidget(widgetKey, undefined);
+  pi.on("session_shutdown", async (_event, ctx) => {
+    const shutdownContext = activeContext ?? ctx;
     activeContext = undefined;
     activeAgents.clear();
-    await manager.shutdown();
+    try {
+      if (shutdownContext?.mode === "tui") shutdownContext.ui.setWidget(widgetKey, undefined);
+    } catch (error) { reportError(error, shutdownContext); }
+    try {
+      await manager?.shutdown();
+    } catch (error) { reportError(error, shutdownContext); }
   });
 
   pi.registerTool(spawnAgentTool);
@@ -340,7 +382,7 @@ ${cachedSkills.length ? cachedSkills.map((skill) => `- \`${skill.name}\` — ${s
     }),
     async execute(_id: string, params: any, signal: AbortSignal | undefined, _onUpdate: any, ctx: any) {
       try {
-        const result = await manager.waitAgent(parentSessionId(ctx), parseTargets(params.targets), signal);
+        const result = await ensureManager(ctx).waitAgent(parentSessionId(ctx), parseTargets(params.targets), signal);
         return boundedTextResult(JSON.stringify(result, null, 2), { message: result.message });
       } catch (error) {
         if (signal?.aborted) throw error;
@@ -366,7 +408,7 @@ ${cachedSkills.length ? cachedSkills.map((skill) => `- \`${skill.name}\` — ${s
     }),
     async execute(_id: string, params: any, signal: AbortSignal | undefined, _onUpdate: any, ctx: any) {
       try {
-        const result = await manager.waitAllAgents(parentSessionId(ctx), parseTargets(params.targets), signal);
+        const result = await ensureManager(ctx).waitAllAgents(parentSessionId(ctx), parseTargets(params.targets), signal);
         return boundedTextResult(JSON.stringify(result, null, 2), { message: result.message });
       } catch (error) {
         if (signal?.aborted) throw error;
@@ -394,7 +436,7 @@ ${cachedSkills.length ? cachedSkills.map((skill) => `- \`${skill.name}\` — ${s
       offset: Type.Optional(Type.Integer({ minimum: 0, description: "Zero-based offset into the compact ordered result. Default 0." })),
     }),
     async execute(_id: string, params: any, _signal: AbortSignal | undefined, _onUpdate: any, ctx: any) {
-      const listed = manager.listAgents(params.path_prefix, parentSessionId(ctx), params.include_all === true);
+      const listed = ensureManager(ctx).listAgents(params.path_prefix, parentSessionId(ctx), params.include_all === true);
       const ordered = [
         ...listed.filter((agent) => agent.agent_status === "starting" || agent.agent_status === "running"),
         ...listed.filter((agent) => agent.agent_status !== "starting" && agent.agent_status !== "running"),
@@ -426,7 +468,7 @@ ${cachedSkills.length ? cachedSkills.map((skill) => `- \`${skill.name}\` — ${s
     parameters: Type.Object({ target: Type.String({ description: "Session-owned agent task name." }) }),
     async execute(_id: string, params: any, _signal: AbortSignal | undefined, _onUpdate: any, ctx: any) {
       try {
-        const result = manager.readAgentResponse(cleanTarget(params.target), parentSessionId(ctx));
+        const result = ensureManager(ctx).readAgentResponse(cleanTarget(params.target), parentSessionId(ctx));
         return boundedTextResult(JSON.stringify(result, null, 2), { agent_name: result.agent_name, status: result.status });
       } catch (error) {
         throw new Error(`read_agent_response failed: ${error instanceof Error ? error.message : String(error)}`);
@@ -451,7 +493,7 @@ ${cachedSkills.length ? cachedSkills.map((skill) => `- \`${skill.name}\` — ${s
     }),
     async execute(_id: string, params: any, _signal: AbortSignal | undefined, _onUpdate: any, ctx: any) {
       try {
-        const result = await manager.sendMessage(parentSessionId(ctx), cleanTarget(params.target), params.message);
+        const result = await ensureManager(ctx).sendMessage(parentSessionId(ctx), cleanTarget(params.target), params.message);
         return textResult(result.delivery === "steer" ? "Message steered into the running agent." : "Message started a new agent turn.", { target: params.target, ...result });
       } catch (error) {
         throw new Error(`send_message failed: ${error instanceof Error ? error.message : String(error)}`);
@@ -471,7 +513,7 @@ ${cachedSkills.length ? cachedSkills.map((skill) => `- \`${skill.name}\` — ${s
     parameters: Type.Object({ target: Type.String({ description: "Session-owned agent task name." }) }),
     async execute(_id: string, params: any, _signal: AbortSignal | undefined, _onUpdate: any, ctx: any) {
       try {
-        const result = await manager.interruptAgent(parentSessionId(ctx), cleanTarget(params.target));
+        const result = await ensureManager(ctx).interruptAgent(parentSessionId(ctx), cleanTarget(params.target));
         return textResult("Interrupt request handled.", result);
       } catch (error) {
         throw new Error(`interrupt_agent failed: ${error instanceof Error ? error.message : String(error)}`);
@@ -489,6 +531,7 @@ ${cachedSkills.length ? cachedSkills.map((skill) => `- \`${skill.name}\` — ${s
       ctx.ui.notify("Subagent overlays require interactive TUI mode.", "warning");
       return;
     }
+    const manager = ensureManager(ctx);
     let info: AgentInfo;
     try { info = manager.getAgentInfo(task, scopeId); }
     catch (error) { ctx.ui.notify(error instanceof Error ? error.message : String(error), "error"); return; }
@@ -520,6 +563,7 @@ ${cachedSkills.length ? cachedSkills.map((skill) => `- \`${skill.name}\` — ${s
   }
 
   async function pickAgent(ctx: any): Promise<{ task: string; parentSessionId: string; includeAll: boolean } | undefined> {
+    const manager = ensureManager(ctx);
     const currentSessionId = parentSessionId(ctx);
     return ctx.ui.custom((tui: any, theme: any, _keybindings: any, done: any) => {
       let selected = 0;

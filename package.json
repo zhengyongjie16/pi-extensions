@@ -9,7 +9,7 @@
     "extensions": [
       "./packages/pi-auto-permissions/index.ts",
       "./packages/pi-codex-compaction/index.ts",
-      "./packages/pi-codex-subagents/index.ts",
+      "./packages/pi-codex-subagents/src/index.ts",
       "./packages/pi-flicker/index.ts",
       "./packages/pi-ghost/index.ts",
       "./packages/pi-ghostty-theme-sync/index.ts",

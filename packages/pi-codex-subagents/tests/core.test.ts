@@ -1,9 +1,11 @@
-import { afterAll, afterEach, beforeEach, describe, expect, mock, test } from "bun:test";
+import { afterAll, afterEach, beforeEach, describe, expect, mock, spyOn, test } from "bun:test";
 import { randomUUID } from "node:crypto";
 import { spawnSync } from "node:child_process";
 import { once } from "node:events";
 import { stripVTControlCharacters } from "node:util";
-import type { AgentInfo } from "./core.js";
+import { configureCoreFixture, deferred, type CoreFixtureState } from "./fixtures/core-sdk-fixture.js";
+import { StringDecoder } from "node:string_decoder";
+import type { AgentInfo } from "../src/core.js";
 import type { ExtensionAPI, ToolExecutionComponent, ToolRenderers } from "@earendil-works/pi-coding-agent";
 import * as fs from "node:fs";
 import * as net from "node:net";
@@ -13,33 +15,28 @@ import { TuiAltScreen, TuiMainScreen, visibleWidth, type Terminal } from "@earen
 
 // macOS os.tmpdir() can be too long for a Unix socket address; keep the POSIX root short.
 const TEST_AGENT_DIR = fs.mkdtempSync(path.join(process.platform === "win32" ? os.tmpdir() : "/tmp", "ps-"));
-const FAKE_RPC_SOURCE = path.join(import.meta.dir, "test", "fake-rpc-child.js");
-// Windows cannot spawn a shebang script directly; keep the executable fixture isolated.
-const FAKE_RPC_CHILD = process.platform === "win32" ? path.join(TEST_AGENT_DIR, "fake-rpc-child.exe") : FAKE_RPC_SOURCE;
-if (process.platform === "win32") {
-  const build = spawnSync(process.execPath, ["build", "--compile", FAKE_RPC_SOURCE, "--outfile", FAKE_RPC_CHILD], { encoding: "utf8" });
-  if (build.status !== 0) throw new Error(`Failed to compile the RPC test fixture: ${build.stderr}`);
-}
+const CORE_SDK_EXTENSION = path.join(import.meta.dir, "fixtures", "core-sdk-fixture.ts");
 const previousTempDir = process.env.PI_SUBAGENT_TEMP_DIR;
 process.env.PI_SUBAGENT_TEMP_DIR = TEST_AGENT_DIR;
+const previousSdkEnv = Object.fromEntries(["PI_CODING_AGENT_DIR", "PI_OFFLINE", "PI_SKIP_VERSION_CHECK", "PI_TELEMETRY"].map((key) => [key, process.env[key]]));
+Object.assign(process.env, { PI_CODING_AGENT_DIR: TEST_AGENT_DIR, PI_OFFLINE: "1", PI_SKIP_VERSION_CHECK: "1", PI_TELEMETRY: "0" });
+fs.writeFileSync(path.join(TEST_AGENT_DIR, "settings.json"), JSON.stringify({ compaction: { enabled: false }, retry: { enabled: false }, cacheWarming: "off" }));
 afterAll(() => {
   if (previousTempDir === undefined) delete process.env.PI_SUBAGENT_TEMP_DIR;
   else process.env.PI_SUBAGENT_TEMP_DIR = previousTempDir;
+  for (const [key, value] of Object.entries(previousSdkEnv)) {
+    if (value === undefined) delete process.env[key];
+    else process.env[key] = value;
+  }
   fs.rmSync(TEST_AGENT_DIR, { recursive: true, force: true });
 });
 
 const codingAgent = await import("@earendil-works/pi-coding-agent");
-mock.module("@earendil-works/pi-coding-agent", () => ({
-  ...codingAgent,
-  CONFIG_DIR_NAME: ".pi",
-  getAgentDir: () => TEST_AGENT_DIR,
-}));
 
 const {
   AgentManager,
   EventBroadcaster,
   RpcAssistantStreamState,
-  RpcJsonlDecoder,
   consumeFirstMatchingMailboxEvent,
   formatAgentError,
   formatContextUsage,
@@ -53,8 +50,8 @@ const {
   parentScopeKey,
   parseAgentDefinitionText,
   taskStorageKey,
-} = await import("./core.js");
-const { formatAgentSpecLines, SubagentPeekOverlay } = await import("./peek.js");
+} = await import("../src/core.js");
+const { formatAgentSpecLines, SubagentPeekOverlay } = await import("../src/peek.js");
 const nativeCodemodeRenderers: ToolRenderers = {};
 await codingAgent.createCodemodeExtension()({
   registerTool(definition) {
@@ -72,7 +69,7 @@ test("formats the resolved subagent model and thinking for the detail overlay", 
   ]);
 });
 
-describe("RPC streaming", () => {
+describe("observer stream reconstruction", () => {
   test("assembles delta-only messages and distinguishes tool calls from thinking", () => {
     const stream = new RpcAssistantStreamState();
     stream.start({
@@ -108,7 +105,7 @@ describe("RPC streaming", () => {
   });
 });
 
-describe("RPC framing", () => {
+describe("filesystem error reporting", () => {
   test("explains explicit quota error codes on every platform", () => {
     expect(formatAgentError(Object.assign(new Error("write failed"), { code: "EDQUOT" })))
       .toContain("Disk quota exceeded (EDQUOT).");
@@ -121,13 +118,6 @@ describe("RPC framing", () => {
     expect(formatAgentError(error)).toContain("Disk quota exceeded (EDQUOT).");
   });
 
-  test("splits only on LF and preserves Unicode line separators", () => {
-    const decoder = new RpcJsonlDecoder();
-    const payload = JSON.stringify({ text: "before\u2028after" });
-    expect(decoder.push(Buffer.from(payload.slice(0, 7)))).toEqual([]);
-    expect(decoder.push(Buffer.from(`${payload.slice(7)}\n`))).toEqual([payload]);
-    expect(decoder.end()).toEqual([]);
-  });
 });
 
 describe("session-scoped identities", () => {
@@ -336,10 +326,6 @@ async function waitUntil(predicate: () => boolean, timeoutMs = 5000): Promise<vo
   throw new Error("Timed out waiting for condition.");
 }
 
-function pidAlive(pid: number): boolean {
-  try { process.kill(pid, 0); return true; } catch { return false; }
-}
-
 async function readSocketEvents(socketPath: string, count: number): Promise<any[]> {
   return await new Promise((resolve, reject) => {
     const socket = net.connect(socketPath);
@@ -376,9 +362,40 @@ function spawnParams(parentSessionId: string, task_name: string, message: string
   };
 }
 
+const configFile = path.join(TEST_AGENT_DIR, "pi-codex-subagents", "config.json");
+function writeConfig(config: Record<string, any> = {}) {
+  fs.mkdirSync(path.dirname(configFile), { recursive: true });
+  fs.writeFileSync(configFile, JSON.stringify({ defaults: { extensions: [CORE_SDK_EXTENSION] }, ...config }));
+}
+let fixture: CoreFixtureState;
+beforeEach(() => {
+  fixture = configureCoreFixture();
+  writeConfig();
+});
+async function released(manager: InstanceType<typeof AgentManager>, info: AgentInfo) {
+  await waitUntil(() => !manager["live"].has(info.id), 7000);
+}
+function sessionMessages(info: AgentInfo): any[] {
+  if (!fs.existsSync(info.sessionFile)) return [];
+  return fs.readFileSync(info.sessionFile, "utf8").trim().split("\n").filter(Boolean)
+    .map((line) => JSON.parse(line)).filter((entry) => entry.type === "message").map((entry) => entry.message);
+}
+const markerDir = path.join(TEST_AGENT_DIR, "pi-codex-subagents", os.userInfo().username, "sockets");
+const activeMarker = (id: string) => path.join(markerDir, id + ".active.json");
+const peekMarker = (id: string) => path.join(markerDir, id + ".peek.json");
+// This is the retained observer socket's framing, not a child-engine RPC decoder.
+class ObserverJsonlDecoder {
+  private decoder = new StringDecoder("utf8");
+  private buffer = "";
+  push(chunk: Buffer): string[] {
+    const lines = (this.buffer + this.decoder.write(chunk)).split("\n");
+    this.buffer = lines.pop()!;
+    return lines.filter(Boolean);
+  }
+}
+
 describe("spawn model and thinking resolution", () => {
   test("caller wins, then the template, then the inherited value, then the default", async () => {
-    process.env.PI_SUBAGENT_PI_BIN = FAKE_RPC_CHILD;
     const parentSessionId = "spawn-overrides";
     fs.rmSync(path.join(getRunsDir(), parentScopeKey(parentSessionId)), { recursive: true, force: true });
     const templateFile = path.join(TEST_AGENT_DIR, "pi-codex-subagents", "agents", "routed.md");
@@ -407,7 +424,6 @@ describe("spawn model and thinking resolution", () => {
       await manager.shutdown();
       fs.rmSync(templateFile, { force: true });
       fs.rmSync(modelOnlyFile, { force: true });
-      delete process.env.PI_SUBAGENT_PI_BIN;
     }
   });
 
@@ -420,7 +436,6 @@ describe("spawn model and thinking resolution", () => {
     ["empty-model", "provider: template-provider\nmodel:", "test", "fake"],
     ["blank-both", 'provider: "   "\nmodel: "   "', "test", "fake"],
   ])("resolves %s without changing inherited thinking", async (name, fields, provider, modelId) => {
-    process.env.PI_SUBAGENT_PI_BIN = FAKE_RPC_CHILD;
     const parentSessionId = `template-resolution-${name}`;
     const scope = path.join(getRunsDir(), parentScopeKey(parentSessionId));
     const templateFile = path.join(TEST_AGENT_DIR, "pi-codex-subagents", "agents", `${name}.md`);
@@ -435,387 +450,512 @@ describe("spawn model and thinking resolution", () => {
       await manager.shutdown();
       fs.rmSync(templateFile, { force: true });
       fs.rmSync(scope, { recursive: true, force: true });
-      delete process.env.PI_SUBAGENT_PI_BIN;
     }
   });
 });
 
-describe("child model validation", () => {
-  const invalidRoutes: Array<[string, string, string, Record<string, unknown>, string]> = [
-    ["unknown-provider", "unknown-provider", "fake", {}, "not registered"],
-    ["unknown-id", "test", "not-registered", {}, "not registered"],
-    ["case-sensitive-id", "test", "Fake", {}, "not registered"],
-    ["fuzzy-id", "openai", "gpt", { state: { model: { provider: "openai", id: "gpt-5" } } }, "not registered"],
-    ["custom-unregistered", "openai", "custom/unregistered", {}, "not registered"],
-    ["missing-catalog", "test", "fake", { availableModels: {} }, "not registered"],
-    ["malformed-catalog", "test", "fake", { availableModels: { models: {} } }, "not registered"],
-    ["empty-catalog", "test", "fake", { availableModels: { models: [] } }, "not registered"],
-    ["crossed-pairs", "test", "fake", { availableModels: { models: [null, {}, { provider: "test", id: "other" }, { provider: "other", id: "fake" }] } }, "not registered"],
-    ["no-selected-model", "test", "fake", { state: {} }, "get_state selected no model"],
-    ["missing-state", "test", "fake", { state: null }, "get_state selected no model"],
-    ["selected-provider-mismatch", "test", "fake", { state: { model: { provider: "other", id: "fake" } } }, 'get_state selected "other/fake"'],
-    ["selected-id-mismatch", "test", "fake", { state: { model: { provider: "test", id: "template-model" } } }, 'get_state selected "test/template-model"'],
-  ];
-
-  test.each(invalidRoutes)("rejects %s before any prompt and cleans up the child", async (name, provider, modelId, responses, reason) => {
-    process.env.PI_SUBAGENT_PI_BIN = FAKE_RPC_CHILD;
-    process.env.PI_SUBAGENT_TEST_MODEL_RESPONSES = JSON.stringify(responses);
-    const parentSessionId = `invalid-route-${name}`;
-    const scope = path.join(getRunsDir(), parentScopeKey(parentSessionId));
-    const templateFile = path.join(TEST_AGENT_DIR, "pi-codex-subagents", "agents", `${name}.md`);
-    const completions: any[] = [];
-    const manager = new AgentManager({ onUnclaimedCompletion: (event) => completions.push(event) });
-    fs.writeFileSync(templateFile, `---\nname: ${name}\nprovider: ${provider}\nmodel: ${modelId}\n---\n`);
-    try {
-      const target = `${provider}/${modelId}`;
-      await expect(manager.spawnAgent({ ...spawnParams(parentSessionId, "worker", "must not run"), agent_type: name }))
-        .rejects.toThrow(target);
-      const failed = manager.getAgentInfo("worker", parentSessionId);
-      expect(failed).toMatchObject({ provider, modelId, status: "failed", messageCount: 0 });
-      expect(failed.error).toContain(reason);
-      expect(failed.finalResponse).toBeUndefined();
-      expect(failed.childProcess).toBeUndefined();
-      const records = fs.readFileSync(failed.sessionFile, "utf8").trim().split("\n").map((line) => JSON.parse(line));
-      expect(records.filter((entry) => entry.type === "prompt" || entry.type === "set_model")).toEqual([]);
-      expect(records.some((entry) => entry.type === "get_available_models")).toBe(true);
-      expect(pidAlive(records.find((entry) => entry.type === "started").pid)).toBe(false);
-      if (process.platform !== "win32") expect(fs.existsSync(getSocketPath(failed.id))).toBe(false);
-      const markerDirectory = path.join(process.env.PI_SUBAGENT_TEMP_DIR!, "pi-codex-subagents", os.userInfo().username, "sockets");
-      expect(fs.existsSync(path.join(markerDirectory, `${failed.id}.active.json`))).toBe(false);
-      expect(completions).toEqual([expect.objectContaining({ status: "failed", error: failed.error })]);
-    } finally {
-      await manager.shutdown();
-      fs.rmSync(templateFile, { force: true });
-      fs.rmSync(scope, { recursive: true, force: true });
-      delete process.env.PI_SUBAGENT_PI_BIN;
-      delete process.env.PI_SUBAGENT_TEST_MODEL_RESPONSES;
-    }
-  });
-
-  test("accepts an exact slash-containing template ID using read-only checks", async () => {
-    process.env.PI_SUBAGENT_PI_BIN = FAKE_RPC_CHILD;
-    const parentSessionId = "exact-slash-route";
-    const scope = path.join(getRunsDir(), parentScopeKey(parentSessionId));
-    const templateFile = path.join(TEST_AGENT_DIR, "pi-codex-subagents", "agents", "slash-route.md");
-    const modelId = "accounts/fireworks/models/glm-5p2";
-    const manager = new AgentManager();
-    fs.writeFileSync(templateFile, `---\nname: slash-route\nmodel: ${modelId}\n---\n`);
-    try {
-      await manager.spawnAgent({
-        ...spawnParams(parentSessionId, "worker", "hold exact route"),
-        agent_type: "slash-route", inheritedProvider: "fireworks", inheritedModelId: "unused-parent-model",
-      });
-      const info = manager.getAgentInfo("worker", parentSessionId);
-      expect(info).toMatchObject({ provider: "fireworks", modelId, model: `fireworks:${modelId}`, status: "running" });
-      const records = fs.readFileSync(info.sessionFile, "utf8").trim().split("\n").map((line) => JSON.parse(line));
-      expect(records.filter((entry) => entry.type !== "get_session_stats").map((entry) => entry.type))
-        .toEqual(["started", "get_state", "get_available_models", "prompt"]);
-    } finally {
-      await manager.shutdown();
-      fs.rmSync(templateFile, { force: true });
-      fs.rmSync(scope, { recursive: true, force: true });
-      delete process.env.PI_SUBAGENT_PI_BIN;
-    }
-  });
-
-  const restartFailures: Array<[string, Record<string, unknown>, string]> = [
-    ["catalog-drift", { availableModels: { models: [{ provider: "openai", id: "gpt-5" }] } }, "test/template-model"],
-    ["selection-drift", { state: { model: { provider: "openai", id: "gpt-5" } } }, "test/template-model"],
-    ["startup-exit", { exitOn: "get_state" }, "code=23"],
-  ];
-  test.each(restartFailures)("revalidates the persisted pair on restart after %s", async (name, responses, reason) => {
-    process.env.PI_SUBAGENT_PI_BIN = FAKE_RPC_CHILD;
-    const parentSessionId = `restart-validation-${name}`;
-    const scope = path.join(getRunsDir(), parentScopeKey(parentSessionId));
-    const templateFile = path.join(TEST_AGENT_DIR, "pi-codex-subagents", "agents", `restart-${name}.md`);
-    const completions: any[] = [];
-    const manager = new AgentManager({ onUnclaimedCompletion: (event) => completions.push(event) });
-    fs.writeFileSync(templateFile, `---\nname: restart-${name}\nmodel: template-model\n---\n`);
-    try {
-      await manager.spawnAgent({ ...spawnParams(parentSessionId, "worker", "first"), agent_type: `restart-${name}` });
-      await waitUntil(() => {
-        const info = manager.getAgentInfo("worker", parentSessionId);
-        return info.status === "completed" && !info.childProcess;
-      });
-      // A template edit must not replace the saved pair at restart.
-      fs.writeFileSync(templateFile, `---\nname: restart-${name}\nprovider: openai\nmodel: gpt-5\n---\n`);
-      process.env.PI_SUBAGENT_TEST_MODEL_RESPONSES = JSON.stringify(responses);
-      await expect(manager.sendMessage(parentSessionId, "worker", "must not run")).rejects.toThrow(reason);
-      const failed = manager.getAgentInfo("worker", parentSessionId);
-      expect(failed).toMatchObject({ provider: "test", modelId: "template-model", model: "test:template-model", status: "failed", messageCount: 1 });
-      expect(failed.error).toContain(reason);
-      expect(failed.finalResponse).toBeUndefined();
-      expect(failed.childProcess).toBeUndefined();
-      const records = fs.readFileSync(failed.sessionFile, "utf8").trim().split("\n").map((line) => JSON.parse(line));
-      const starts = records.filter((entry) => entry.type === "started");
-      expect(starts).toHaveLength(2);
-      for (const start of starts) {
-        expect(start.args[start.args.indexOf("--provider") + 1]).toBe("test");
-        expect(start.args[start.args.indexOf("--model") + 1]).toBe("template-model");
-        expect(pidAlive(start.pid)).toBe(false);
-      }
-      expect(records.filter((entry) => entry.type === "prompt").map((entry) => entry.message)).toEqual(["first"]);
-      expect(records.filter((entry) => entry.type === "get_state")).toHaveLength(2);
-      if (name !== "startup-exit") expect(records.filter((entry) => entry.type === "get_available_models")).toHaveLength(2);
-      expect((await manager.waitAgent(parentSessionId, ["worker"])).event).toMatchObject({ status: "failed", error: failed.error });
-      expect(completions.filter((event) => event.status === "failed")).toHaveLength(1);
-    } finally {
-      await manager.shutdown();
-      fs.rmSync(templateFile, { force: true });
-      fs.rmSync(scope, { recursive: true, force: true });
-      delete process.env.PI_SUBAGENT_PI_BIN;
-      delete process.env.PI_SUBAGENT_TEST_MODEL_RESPONSES;
-    }
-  });
-});
-
-describe("concurrent restarts", () => {
+describe("SDK model validation", () => {
   test.each([
-    ["hibernated", "invalid"],
-    ["hibernated", "valid"],
-    ["terminating", "invalid"],
-    ["owned-cleanup", "invalid"],
-  ] as const)("rejects a pending restart after %s (%s catalog)", async (phase, catalog) => {
-    const validCatalog = catalog === "valid";
-    process.env.PI_SUBAGENT_PI_BIN = FAKE_RPC_CHILD;
-    const parentSessionId = `concurrent-restart-${phase}-${validCatalog}`;
-    const scope = path.join(getRunsDir(), parentScopeKey(parentSessionId));
+    ["unknown-provider", "fake"], ["test", "not-registered"], ["test", "Fake"],
+    ["openai", "gpt"], ["openai", "custom/unregistered"],
+  ])("rejects unavailable exact route %s/%s before submitting a prompt", async (provider, modelId) => {
+    const parent = "unavailable-" + randomUUID();
     const completions: any[] = [];
     const manager = new AgentManager({ onUnclaimedCompletion: (event) => completions.push(event) });
-    let releaseCleanup = () => {};
-    let interruption: Promise<unknown> | undefined;
     try {
-      const initialTask = phase === "terminating" ? "hold first" : "first";
-      await manager.spawnAgent(spawnParams(parentSessionId, "worker", initialTask));
-      const initial = manager.getAgentInfo("worker", parentSessionId);
-      let cleanupCalls = 0;
-      if (phase === "terminating") {
-        interruption = manager.interruptAgent(parentSessionId, "worker");
-        await Promise.resolve();
-        expect(manager["live"].get(initial.id)?.expectedExit).toBe(true);
-      } else {
-        await waitUntil(() => {
-          const info = manager.getAgentInfo("worker", parentSessionId);
-          return info.status === "completed" && !info.childProcess;
-        });
-        if (phase === "owned-cleanup") {
-          // Force both callers across an async cleanup gap for stale persisted ownership.
-          const info = manager.getAgentInfo("worker", parentSessionId);
-          info.childProcess = initial.childProcess;
-          fs.writeFileSync(info.infoFile, JSON.stringify(info));
-          const cleanupGate = new Promise<void>((resolve) => { releaseCleanup = resolve; });
-          const terminate = manager["terminateOwnedChild"].bind(manager);
-          manager["terminateOwnedChild"] = async (owned) => {
-            cleanupCalls++;
-            await cleanupGate;
-            await terminate(owned);
-          };
-        }
-      }
-      if (!validCatalog) process.env.PI_SUBAGENT_TEST_MODEL_RESPONSES = JSON.stringify({ availableModels: { models: [] } });
-      const pending = Promise.allSettled([
-        manager.sendMessage(parentSessionId, "worker", "hold first restart"),
-        manager.sendMessage(parentSessionId, "worker", "hold second restart"),
-      ]);
-      await Promise.resolve();
-      releaseCleanup();
-      const attempts = await pending;
-      await interruption;
-      expect(attempts[1]).toMatchObject({
-        status: "rejected", reason: expect.objectContaining({ message: expect.stringContaining("still starting") }),
-      });
-      if (validCatalog) expect(attempts[0]).toEqual({ status: "fulfilled", value: { delivery: "prompt" } });
-      else expect(attempts[0]).toMatchObject({
-        status: "rejected", reason: expect.objectContaining({ message: expect.stringContaining("not registered") }),
-      });
-      if (phase === "owned-cleanup") expect(cleanupCalls).toBe(2);
-      const info = manager.getAgentInfo("worker", parentSessionId);
-      expect(info).toMatchObject({ status: validCatalog ? "running" : "failed", messageCount: validCatalog ? 2 : 1 });
+      await expect(manager.spawnAgent({ ...spawnParams(parent, "worker", "must not run"), model: { provider, modelId } }))
+        .rejects.toThrow(provider + "/" + modelId);
+      const info = manager.getAgentInfo("worker", parent);
+      expect(info).toMatchObject({ provider, modelId, status: "failed", messageCount: 0 });
       expect(info.finalResponse).toBeUndefined();
-      if (!validCatalog) expect(info.error).toContain("not registered");
-      expect(completions.filter((event) => event.status === "failed")).toHaveLength(validCatalog ? 0 : 1);
-      const records = fs.readFileSync(info.sessionFile, "utf8").trim().split("\n").map((line) => JSON.parse(line));
-      const starts = records.filter((entry) => entry.type === "started");
-      expect(starts).toHaveLength(2);
-      if (!validCatalog) {
-        expect(info.childProcess).toBeUndefined();
-        for (const start of starts) expect(pidAlive(start.pid)).toBe(false);
-      }
-      expect(records.filter((entry) => entry.type === "prompt").map((entry) => entry.message))
-        .toEqual(validCatalog ? [initialTask, "hold first restart"] : [initialTask]);
-      const restart = records.slice(records.findLastIndex((entry) => entry.type === "started"));
-      expect(restart.slice(0, 3).map((entry) => entry.type)).toEqual(["started", "get_state", "get_available_models"]);
-      await manager.shutdown();
-      expect(manager.getAgentInfo("worker", parentSessionId).childProcess).toBeUndefined();
-      for (const start of starts) expect(pidAlive(start.pid)).toBe(false);
-    } finally {
-      releaseCleanup();
-      await interruption;
-      await manager.shutdown();
-      fs.rmSync(scope, { recursive: true, force: true });
-      delete process.env.PI_SUBAGENT_PI_BIN;
-      delete process.env.PI_SUBAGENT_TEST_MODEL_RESPONSES;
-    }
-  });
-});
-
-describe("startup retry failure recording", () => {
-  test.each(["failed", "interrupted"] as const)("records each new startup failure after a prior %s run", async (priorStatus) => {
-    process.env.PI_SUBAGENT_PI_BIN = FAKE_RPC_CHILD;
-    const parentSessionId = `startup-retry-${priorStatus}`;
-    const scope = path.join(getRunsDir(), parentScopeKey(parentSessionId));
-    const completions: any[] = [];
-    const manager = new AgentManager({ onUnclaimedCompletion: (event) => completions.push(event) });
-    try {
-      if (priorStatus === "failed") {
-        process.env.PI_SUBAGENT_TEST_MODEL_RESPONSES = JSON.stringify({ availableModels: { models: [] } });
-        await expect(manager.spawnAgent(spawnParams(parentSessionId, "worker", "must not run"))).rejects.toThrow("not registered");
-      } else {
-        await manager.spawnAgent(spawnParams(parentSessionId, "worker", "hold old task"));
-        await manager.interruptAgent(parentSessionId, "worker");
-      }
-      let previous = manager.getAgentInfo("worker", parentSessionId);
-      expect(previous.status).toBe(priorStatus);
-      let previousCompletionId = completions.at(-1)?.id;
-      process.env.PI_SUBAGENT_TEST_MODEL_RESPONSES = JSON.stringify({ exitOn: "get_state" });
-      for (let attempt = 0; attempt < 2; attempt++) {
-        const completionCount = completions.length;
-        let returnedError: Error | undefined;
-        try {
-          await manager.sendMessage(parentSessionId, "worker", "must not run");
-        } catch (error) {
-          returnedError = error as Error;
-        }
-        expect(returnedError).toBeInstanceOf(Error);
-        const message = returnedError!.message;
-        expect(message).toContain("code=23");
-        if (attempt === 0 && priorStatus === "failed") expect(previous.error).not.toBe(message);
-        if (attempt === 1) expect(previous.error).toBe(message); // Identical causes are still distinct attempts.
-        const failed = manager.getAgentInfo("worker", parentSessionId);
-        expect(failed).toMatchObject({ status: "failed", error: message, messageCount: previous.messageCount });
-        expect(failed.finalResponse).toBeUndefined();
-        expect(failed.childProcess).toBeUndefined();
-        expect(completions.slice(completionCount)).toEqual([expect.objectContaining({ status: "failed", error: message })]);
-        const completion = completions[completionCount];
-        expect(completion.id).not.toBe(previousCompletionId);
-        expect((await manager.waitAgent(parentSessionId, ["worker"])).event).toMatchObject({ id: completion.id, status: "failed", error: message });
-        const records = fs.readFileSync(failed.sessionFile, "utf8").trim().split("\n").map((line) => JSON.parse(line));
-        const starts = records.filter((entry) => entry.type === "started");
-        expect(starts).toHaveLength(attempt + 2);
-        for (const start of starts) expect(pidAlive(start.pid)).toBe(false);
-        expect(records.filter((entry) => entry.type === "prompt").map((entry) => entry.message))
-          .toEqual(priorStatus === "interrupted" ? ["hold old task"] : []);
-        previous = failed;
-        previousCompletionId = completion.id;
-      }
-    } finally {
-      await manager.shutdown();
-      fs.rmSync(scope, { recursive: true, force: true });
-      delete process.env.PI_SUBAGENT_PI_BIN;
-      delete process.env.PI_SUBAGENT_TEST_MODEL_RESPONSES;
-    }
-  });
-});
-
-describe("child process lifecycle", () => {
-  test.each(["completed", "failed", "interrupted"] as const)("preserves the previous %s result when shutdown cancels a pending restart", async (status) => {
-    process.env.PI_SUBAGENT_PI_BIN = FAKE_RPC_CHILD;
-    const parentSessionId = `shutdown-pending-restart-${status}`;
-    const scope = path.join(getRunsDir(), parentScopeKey(parentSessionId));
-    const completions: any[] = [];
-    const manager = new AgentManager({ onUnclaimedCompletion: (event) => completions.push(event) });
-    const firstMessage = status === "failed" ? "fail first" : status === "interrupted" ? "hold first" : "first";
-    try {
-      await manager.spawnAgent(spawnParams(parentSessionId, "worker", firstMessage));
-      if (status === "interrupted") await manager.interruptAgent(parentSessionId, "worker");
-      await waitUntil(() => {
-        const info = manager.getAgentInfo("worker", parentSessionId);
-        return info.status === status && !info.childProcess;
-      });
-      const previous = manager.getAgentInfo("worker", parentSessionId);
-      const previousCompletionIds = completions.map((event) => event.id);
-      process.env.PI_SUBAGENT_TEST_MODEL_RESPONSES = JSON.stringify({ holdOn: "get_state" });
-      const pending = manager.sendMessage(parentSessionId, "worker", "must not run").then(
-        () => undefined, (error: unknown) => error,
-      );
-      await waitUntil(() => Boolean(manager["live"].get(previous.id)?.pending.size));
-      await manager.shutdown();
-      expect(await pending).toBeInstanceOf(Error);
-      const after = manager.getAgentInfo("worker", parentSessionId);
-      expect(after).toMatchObject({ status, messageCount: previous.messageCount });
-      expect(after.completedAt).toBe(previous.completedAt);
-      expect(after.finalResponse).toBe(previous.finalResponse);
-      expect(after.error).toBe(previous.error);
-      expect(after.childProcess).toBeUndefined();
-      expect(manager["live"].has(previous.id)).toBe(false);
-      expect(completions.map((event) => event.id)).toEqual(previousCompletionIds);
-      const records = fs.readFileSync(after.sessionFile, "utf8").trim().split("\n").map((line) => JSON.parse(line));
-      expect(records.filter((entry) => entry.type === "prompt").map((entry) => entry.message)).toEqual([firstMessage]);
-      const starts = records.filter((entry) => entry.type === "started");
-      expect(starts).toHaveLength(2);
-      for (const start of starts) expect(pidAlive(start.pid)).toBe(false);
-    } finally {
-      await manager.shutdown();
-      fs.rmSync(scope, { recursive: true, force: true });
-      delete process.env.PI_SUBAGENT_PI_BIN;
-      delete process.env.PI_SUBAGENT_TEST_MODEL_RESPONSES;
-    }
+      await released(manager, info);
+      expect(fixture.instances.flatMap((instance) => instance.inputs)).toEqual([]);
+      expect(sessionMessages(info)).toEqual([]);
+      expect(completions).toEqual([expect.objectContaining({ status: "failed", error: info.error })]);
+      expect((await manager.waitAgent(parent, ["worker"])).event?.id).toBe(completions[0].id);
+      expect(fs.existsSync(activeMarker(info.id))).toBe(false);
+    } finally { await manager.shutdown(); }
   });
 
-  test("hibernates after settle and lazily restarts the persisted session", async () => {
-    fs.rmSync(path.join(TEST_AGENT_DIR, "pi-codex-subagents", "config.json"), { force: true });
-    fs.rmSync(path.join(TEST_AGENT_DIR, "pi-codex-subagents", "SYSTEM.md"), { force: true });
-    process.env.PI_SUBAGENT_PI_BIN = FAKE_RPC_CHILD;
-    const parentSessionId = "lifecycle-settle";
-    fs.rmSync(path.join(getRunsDir(), parentScopeKey(parentSessionId)), { recursive: true, force: true });
+  test("an explicit extension load error fails startup without falling back to another model", async () => {
+    const parent = "bad-extension-" + randomUUID();
+    const extension = path.join(TEST_AGENT_DIR, "bad-extension.ts");
+    fs.writeFileSync(extension, 'export default () => { throw new Error("explicit fixture load failure"); };');
+    writeConfig({ defaults: { extensions: [CORE_SDK_EXTENSION, extension] } });
     const manager = new AgentManager();
     try {
-      await manager.spawnAgent(spawnParams(parentSessionId, "worker", "first"));
-      const first = manager.getAgentInfo("worker", parentSessionId);
-      const firstPid = first.childProcess!.pid;
-      await waitUntil(() => {
-        const info = manager.getAgentInfo("worker", parentSessionId);
-        return info.status === "completed" && !info.childProcess;
-      });
-      expect(pidAlive(firstPid)).toBe(false);
-      expect(manager.readAgentResponse("worker", parentSessionId).finalResponse).toBe("response:first");
-
-      expect(await manager.sendMessage(parentSessionId, "worker", "second")).toEqual({ delivery: "prompt" });
-      const secondPid = manager.getAgentInfo("worker", parentSessionId).childProcess!.pid;
-      expect(secondPid).not.toBe(firstPid);
-      await waitUntil(() => {
-        const info = manager.getAgentInfo("worker", parentSessionId);
-        return info.status === "completed" && !info.childProcess;
-      });
-      expect(pidAlive(secondPid)).toBe(false);
-      expect(manager.readAgentResponse("worker", parentSessionId).finalResponse).toBe("response:second");
-      const sessionRecords = fs.readFileSync(first.sessionFile, "utf8").trim().split("\n").map((line) => JSON.parse(line));
-      const starts = sessionRecords.filter((entry) => entry.type === "started");
-      expect(new Set(starts.map((entry) => entry.pid)).size).toBe(2);
-      const systemPromptIndex = starts[0].args.indexOf("--system-prompt");
-      const systemPromptPath = starts[0].args[systemPromptIndex + 1];
-      expect(path.isAbsolute(systemPromptPath)).toBe(true);
-      expect(fs.readFileSync(systemPromptPath, "utf8")).toBe("You are a subagent working for a main agent. Work only on the assigned task and follow its scope precisely.");
-      for (const start of starts) {
-        expect(start.args).toContain("--no-context-files");
-        expect(start.args.slice(start.args.indexOf("--system-prompt"), start.args.indexOf("--system-prompt") + 2)).toEqual([
-          "--system-prompt",
-          systemPromptPath,
-        ]);
-        expect(start.args.slice(start.args.indexOf("--append-system-prompt"), start.args.indexOf("--append-system-prompt") + 2)).toEqual([
-          "--append-system-prompt",
-          "",
-        ]);
-      }
-    } finally {
-      await manager.shutdown();
-      fs.rmSync(path.join(getRunsDir(), parentScopeKey(parentSessionId)), { recursive: true, force: true });
-      delete process.env.PI_SUBAGENT_PI_BIN;
-    }
+      await expect(manager.spawnAgent(spawnParams(parent, "worker", "must not run"))).rejects.toThrow("explicit fixture load failure");
+      const info = manager.getAgentInfo("worker", parent);
+      expect(info.status).toBe("failed");
+      expect(sessionMessages(info)).toEqual([]);
+      await released(manager, info);
+    } finally { await manager.shutdown(); fs.rmSync(extension, { force: true }); }
   });
 
+  test("accepts a slash-containing model ID and retains the saved route/resources when templates change", async () => {
+    const parent = "saved-route-" + randomUUID();
+    const template = path.join(TEST_AGENT_DIR, "pi-codex-subagents", "agents", "saved-route.md");
+    const id = "accounts/fireworks/models/glm-5p2";
+    fs.writeFileSync(template, "---\nname: saved-route\nprovider: fireworks\nmodel: " + id + "\n---\nTemplate instructions.");
+    const manager = new AgentManager();
+    try {
+      await manager.spawnAgent({ ...spawnParams(parent, "worker", "first"), agent_type: "saved-route" });
+      const first = manager.getAgentInfo("worker", parent);
+      await released(manager, first);
+      fs.writeFileSync(template, "---\nname: saved-route\nprovider: openai\nmodel: gpt-5\n---\nChanged template.");
+      expect(await manager.sendMessage(parent, "worker", "second")).toEqual({ delivery: "prompt" });
+      await released(manager, first);
+      const info = manager.getAgentInfo("worker", parent);
+      expect(info).toMatchObject({ provider: "fireworks", modelId: id, messageCount: 2 });
+      expect(fixture.instances).toHaveLength(2);
+      expect(fixture.instances[0].requests[0].text).toBe("Template instructions.\n\nfirst");
+      expect(fixture.instances[1].requests[0].text).toBe("second");
+      expect(info.extensionPaths).toEqual([CORE_SDK_EXTENSION]);
+      fixture = configureCoreFixture({ routes: [["test", "fake"]] });
+      await expect(manager.sendMessage(parent, "worker", "must not run")).rejects.toThrow("fireworks/" + id);
+      expect(manager.getAgentInfo("worker", parent)).toMatchObject({ status: "failed", messageCount: 2, provider: "fireworks", modelId: id });
+      expect(fixture.instances.flatMap((instance) => instance.requests)).toEqual([]);
+    } finally { await manager.shutdown(); fs.rmSync(template, { force: true }); }
+  });
+
+  test.each(["failed", "interrupted"] as const)("records distinct startup failures after a previous %s run", async (prior) => {
+    const parent = "retry-" + randomUUID();
+    const completions: any[] = [];
+    const manager = new AgentManager({ onUnclaimedCompletion: (event) => completions.push(event) });
+    try {
+      await manager.spawnAgent(spawnParams(parent, "worker", prior === "failed" ? "fail old" : "hold old"));
+      if (prior === "interrupted") await manager.interruptAgent(parent, "worker");
+      const initial = manager.getAgentInfo("worker", parent);
+      await released(manager, initial);
+      expect(manager.getAgentInfo("worker", parent).status).toBe(prior);
+      fixture = configureCoreFixture({ routes: [["test", "other"]] });
+      let previousId = manager["mailbox"].at(-1)!.id;
+      for (let attempt = 0; attempt < 2; attempt++) {
+        const before = completions.length;
+        await expect(manager.sendMessage(parent, "worker", "must not run")).rejects.toThrow("test/fake");
+        const info = manager.getAgentInfo("worker", parent);
+        await released(manager, info);
+        expect(info).toMatchObject({ status: "failed", messageCount: 1 });
+        expect(info.finalResponse).toBeUndefined();
+        expect(completions.slice(before)).toEqual([expect.objectContaining({ status: "failed", error: info.error })]);
+        expect(completions.at(-1).id).not.toBe(previousId);
+        previousId = completions.at(-1).id;
+        expect((await manager.waitAgent(parent, ["worker"])).event?.id).toBe(previousId);
+      }
+      expect(fixture.instances.flatMap((instance) => instance.inputs)).toEqual([]);
+    } finally { await manager.shutdown(); }
+  });
+});
+
+describe("SDK lifecycle and cancellation races", () => {
+  test("spawn returns on native acceptance, then releases and reopens the same native history", async () => {
+    const gate = deferred();
+    fixture = configureCoreFixture({ responseGate: gate.promise });
+    const parent = "lifecycle-" + randomUUID();
+    const manager = new AgentManager();
+    try {
+      expect(await manager.spawnAgent(spawnParams(parent, "worker", "hold first"))).toEqual({ task_name: "/worker", nickname: null });
+      const info = manager.getAgentInfo("worker", parent);
+      expect(info.status).toBe("running");
+      const firstSession = manager["live"].get(info.id)!.session!;
+      await waitUntil(() => fixture.instances[0].activeStreams === 1);
+      gate.resolve();
+      await released(manager, info);
+      expect(manager.readAgentResponse("worker", parent).finalResponse).toBe("response:hold first");
+      expect(fixture.instances[0].shutdowns).toBe(1);
+      expect(await manager.sendMessage(parent, "worker", "second")).toEqual({ delivery: "prompt" });
+      const secondSession = manager["live"].get(info.id)?.session;
+      if (secondSession) expect(secondSession).not.toBe(firstSession);
+      await released(manager, info);
+      expect(manager.readAgentResponse("worker", parent).finalResponse).toBe("response:second");
+      expect(sessionMessages(info).filter((entry) => entry.role !== "system").map((entry) => entry.role)).toEqual(["user", "assistant", "user", "assistant"]);
+      const reopened = codingAgent.SessionManager.open(info.sessionFile, path.dirname(info.sessionFile), info.cwd);
+      expect(reopened.buildSessionContext().messages.filter((message) => message.role !== "system")).toHaveLength(4);
+      expect(fixture.instances.map((instance) => instance.shutdowns)).toEqual([1, 1]);
+      expect(fixture.instances[1].requests[0].context.messages.filter((entry: any) => entry.role !== "system").map((entry: any) => entry.role)).toEqual(["user", "assistant", "user"]);
+      expect(fs.existsSync(activeMarker(info.id))).toBe(false);
+      expect(fs.existsSync(peekMarker(info.id))).toBe(false);
+      if (process.platform !== "win32") expect(fs.existsSync(getSocketPath(info.id))).toBe(false);
+    } finally { gate.resolve(); await manager.shutdown(); }
+  });
+
+  test("steers a running native session without opening a second session", async () => {
+    const gate = deferred();
+    fixture = configureCoreFixture({ responseGate: gate.promise });
+    const parent = "steer-" + randomUUID();
+    const completions: any[] = [];
+    const manager = new AgentManager({ onUnclaimedCompletion: (event) => completions.push(event) });
+    try {
+      await manager.spawnAgent(spawnParams(parent, "worker", "hold initial"));
+      expect(await manager.sendMessage(parent, "worker", "next instruction")).toEqual({ delivery: "steer" });
+      expect(fixture.instances).toHaveLength(1);
+      gate.resolve();
+      const info = manager.getAgentInfo("worker", parent);
+      await released(manager, info);
+      expect(manager.readAgentResponse("worker", parent).finalResponse).toBe("response:next instruction");
+      expect(info.sessionFile).toBe(manager.getAgentInfo("worker", parent).sessionFile);
+      expect(fixture.instances[0].inputs.map((event) => event.source)).toEqual(["rpc", "rpc"]);
+      expect(completions).toHaveLength(1);
+    } finally { gate.resolve(); await manager.shutdown(); }
+  });
+
+  test.each(["fail", "aborted"])("treats normal prompt resolution with %s stopReason as a non-success", async (command) => {
+    const parent = "stop-reason-" + randomUUID();
+    const completions: any[] = [];
+    const manager = new AgentManager({ onUnclaimedCompletion: (event) => completions.push(event) });
+    try {
+      await manager.spawnAgent(spawnParams(parent, "worker", command + " now"));
+      const info = manager.getAgentInfo("worker", parent);
+      await released(manager, info);
+      expect(manager.getAgentInfo("worker", parent).status).toBe("failed");
+      expect(manager.readAgentResponse("worker", parent).error).toContain(command === "fail" ? "fixture failure" : "aborted");
+      expect(completions).toHaveLength(1);
+      expect(fixture.instances[0].shutdowns).toBe(1);
+    } finally { await manager.shutdown(); }
+  });
+
+  test("handled input ends with this run's empty response, never the previous answer", async () => {
+    const parent = "handled-" + randomUUID();
+    const completions: any[] = [];
+    const manager = new AgentManager({ onUnclaimedCompletion: (event) => completions.push(event) });
+    try {
+      await manager.spawnAgent(spawnParams(parent, "worker", "first"));
+      const info = manager.getAgentInfo("worker", parent);
+      await released(manager, info);
+      expect(manager.readAgentResponse("worker", parent).finalResponse).toBe("response:first");
+      await manager.sendMessage(parent, "worker", "handled empty");
+      await released(manager, info);
+      const after = manager.getAgentInfo("worker", parent);
+      expect(after.status).toBe("completed");
+      expect(after.finalResponse ?? "").toBe("");
+      expect(after.messageCount).toBe(2);
+      expect(fixture.instances[1].requests).toEqual([]);
+      expect(completions).toHaveLength(2);
+      expect(completions[1].finalResponse ?? "").toBe("");
+      await new Promise((resolve) => setTimeout(resolve, 30));
+      expect(manager.getAgentInfo("worker", parent).status).toBe("completed");
+    } finally { await manager.shutdown(); }
+  });
+
+  test("handled input that starts native work is not finalized or disposed before native idle", async () => {
+    const gate = deferred();
+    fixture = configureCoreFixture({ responseGate: gate.promise });
+    const parent = "handled-work-" + randomUUID();
+    const manager = new AgentManager();
+    try {
+      await manager.spawnAgent(spawnParams(parent, "worker", "handled work"));
+      const info = manager.getAgentInfo("worker", parent);
+      expect(manager["live"].has(info.id)).toBe(true);
+      expect(fixture.instances[0].activeStreams).toBe(1);
+      expect(fixture.instances[0].shutdowns).toBe(0);
+      expect(info.status).toBe("running");
+      gate.resolve();
+      await released(manager, info);
+      expect(manager.readAgentResponse("worker", parent).finalResponse).toBe("response:hold handled-owned-work");
+      expect(fixture.instances[0].shutdowns).toBe(1);
+    } finally { gate.resolve(); await manager.shutdown(); }
+  });
+
+  test.each(["initialization", "input"])("interrupt tracks late %s until it exits, without rollback or duplicate completion", async (phase) => {
+    const gate = deferred();
+    fixture = configureCoreFixture(phase === "initialization" ? { startupGate: gate.promise } : {
+      input: async () => { await gate.promise; },
+    });
+    const parent = "cancel-" + phase + "-" + randomUUID();
+    const completions: any[] = [];
+    const manager = new AgentManager({ onUnclaimedCompletion: (event) => completions.push(event) });
+    const pending = manager.spawnAgent(spawnParams(parent, "worker", "hold late")).then(() => undefined, (error) => error);
+    try {
+      await waitUntil(() => phase === "initialization" ? fixture.instances[0]?.events.includes("session_start") : Boolean(fixture.instances[0]?.inputs.length));
+      const info = manager.getAgentInfo("worker", parent);
+      const interruption = manager.interruptAgent(parent, "worker");
+      await waitUntil(() => manager.getAgentInfo("worker", parent).status === "interrupted");
+      expect(manager["live"].has(info.id)).toBe(true);
+      expect(fixture.instances[0].shutdowns).toBe(0);
+      gate.resolve();
+      await interruption;
+      expect(await pending).toBeInstanceOf(Error);
+      await released(manager, info);
+      expect(manager.getAgentInfo("worker", parent).status).toBe("interrupted");
+      expect(completions).toEqual([]); // Explicit interrupt is waitable, not an automatic notification.
+      expect((await manager.waitAgent(parent, ["worker"])).event?.status).toBe("interrupted");
+      expect(manager["mailbox"].filter((event) => event.parentSessionId === parent)).toEqual([]);
+      expect(fixture.instances[0].shutdowns).toBe(1);
+      expect(fixture.instances[0].activeStreams).toBe(0);
+      if (phase === "initialization") expect(fixture.instances[0].inputs).toEqual([]);
+    } finally { gate.resolve(); await pending; await manager.shutdown(); }
+  });
+
+  test.each(["initialization", "input"])("startup timeout follows late %s to actual release", async (phase) => {
+    const gate = deferred();
+    fixture = configureCoreFixture(phase === "initialization" ? { startupGate: gate.promise } : { input: async () => { await gate.promise; } });
+    const original = globalThis.setTimeout;
+    const timers = spyOn(globalThis, "setTimeout").mockImplementation(((callback: any, delay: number, ...args: any[]) =>
+      original(callback, delay === 15000 ? 300 : delay, ...args)) as typeof setTimeout);
+    const parent = "startup-timeout-" + phase + "-" + randomUUID();
+    const completions: any[] = [];
+    const manager = new AgentManager({ onUnclaimedCompletion: (event) => completions.push(event), onError() {} });
+    const pending = manager.spawnAgent(spawnParams(parent, "worker", "hold late")).then(() => undefined, (error) => error);
+    try {
+      const error = await pending;
+      expect(error).toBeInstanceOf(Error);
+      expect(error.message).toMatch(/timed out|timeout/i);
+      const info = manager.getAgentInfo("worker", parent);
+      expect(info.status).toBe("failed");
+      expect(manager["live"].has(info.id)).toBe(true);
+      expect(fixture.instances[0].shutdowns).toBe(0);
+      gate.resolve();
+      await released(manager, info);
+      expect(completions).toHaveLength(1);
+      expect(manager.getAgentInfo("worker", parent).status).toBe("failed");
+      expect(fixture.instances[0].shutdowns).toBe(1);
+      expect(fixture.instances[0].activeStreams).toBe(0);
+    } finally { timers.mockRestore(); gate.resolve(); await pending; await manager.shutdown(); }
+  });
+
+  test("non-cooperative cancellation returns finitely and blocks reopening until actual release", async () => {
+    const gate = deferred();
+    fixture = configureCoreFixture({ responseGate: gate.promise, ignoreAbort: true });
+    const parent = "non-cooperative-" + randomUUID();
+    const errors: Error[] = [];
+    const manager = new AgentManager({ onError: (error) => errors.push(error) });
+    try {
+      await manager.spawnAgent(spawnParams(parent, "worker", "hold uncooperative"));
+      await waitUntil(() => fixture.instances[0].activeStreams === 1);
+      const info = manager.getAgentInfo("worker", parent);
+      const started = Date.now();
+      await expect(manager.interruptAgent(parent, "worker")).rejects.toThrow(/timed out|cleanup|closing/i);
+      expect(Date.now() - started).toBeLessThan(4000);
+      expect(manager.getAgentInfo("worker", parent).status).toBe("interrupted");
+      expect(manager["live"].has(info.id)).toBe(true);
+      expect(fs.existsSync(activeMarker(info.id))).toBe(true);
+      await expect(manager.sendMessage(parent, "worker", "must not reopen")).rejects.toThrow(/timed out|cleanup|closing/i);
+      expect(fixture.instances).toHaveLength(1);
+      expect(fixture.instances[0].shutdowns).toBe(0);
+      gate.resolve();
+      await released(manager, info);
+      expect(fixture.instances[0].shutdowns).toBe(1);
+      expect(fs.existsSync(activeMarker(info.id))).toBe(false);
+      await manager.sendMessage(parent, "worker", "recovered");
+      await released(manager, info);
+      expect(fixture.instances).toHaveLength(2);
+      expect(manager.readAgentResponse("worker", parent).finalResponse).toBe("response:recovered");
+      expect(errors.length).toBeGreaterThan(0);
+    } finally { gate.resolve(); await manager.shutdown(); }
+  });
+
+  test("publishes completion before extension shutdown, but closing cannot reopen the JSONL", async () => {
+    const gate = deferred();
+    fixture = configureCoreFixture({ shutdownGate: gate.promise });
+    const parent = "shutdown-gate-" + randomUUID();
+    const completions: any[] = [];
+    const manager = new AgentManager({ onUnclaimedCompletion: (event) => completions.push(event), onError() {} });
+    try {
+      await manager.spawnAgent(spawnParams(parent, "worker", "first"));
+      await waitUntil(() => fixture.instances[0].shutdowns === 1);
+      const info = manager.getAgentInfo("worker", parent);
+      expect(info.status).toBe("completed");
+      expect(completions).toHaveLength(1);
+      expect(manager["live"].has(info.id)).toBe(true);
+      await expect(manager.sendMessage(parent, "worker", "must not reopen")).rejects.toThrow(/timed out|cleanup|closing/i);
+      expect(fixture.instances).toHaveLength(1);
+      gate.resolve();
+      await released(manager, info);
+      await manager.sendMessage(parent, "worker", "second");
+      await released(manager, info);
+      expect(fixture.instances.map((instance) => instance.shutdowns)).toEqual([1, 1]);
+    } finally { gate.resolve(); await manager.shutdown(); }
+  });
+
+  test("a late steer cannot claim queued success or dispose the session before its input exits", async () => {
+    const response = deferred();
+    const input = deferred();
+    fixture = configureCoreFixture({ responseGate: response.promise, input: async (event) => {
+      if (event.streamingBehavior === "steer") await input.promise;
+    } });
+    const parent = "late-steer-" + randomUUID();
+    const manager = new AgentManager();
+    try {
+      await manager.spawnAgent(spawnParams(parent, "worker", "hold initial"));
+      const info = manager.getAgentInfo("worker", parent);
+      const pending = manager.sendMessage(parent, "worker", "late steer").then(() => undefined, (error) => error);
+      await waitUntil(() => fixture.instances[0].inputs.length === 2);
+      response.resolve();
+      await waitUntil(() => manager.getAgentInfo("worker", parent).status === "completed");
+      expect(manager["live"].has(info.id)).toBe(true);
+      expect(fixture.instances[0].shutdowns).toBe(0);
+      input.resolve();
+      expect(await pending).toBeInstanceOf(Error);
+      await released(manager, info);
+      expect(fixture.instances[0].requests).toHaveLength(1);
+      expect(fixture.instances[0].shutdowns).toBe(1);
+      expect(manager.readAgentResponse("worker", parent).finalResponse).toBe("response:hold initial");
+    } finally { response.resolve(); input.resolve(); await manager.shutdown(); }
+  });
+
+  test.each(["startup", "input"])("ctx.shutdown during %s cancels the child without stopping its parent", async (phase) => {
+    fixture = configureCoreFixture({ shutdownAtStart: phase === "startup" });
+    const parent = "extension-shutdown-" + phase + "-" + randomUUID();
+    const manager = new AgentManager();
+    try {
+      await manager.spawnAgent(spawnParams(parent, "worker", phase === "input" ? "shutdown input" : "must not run")).catch(() => {});
+      const info = manager.getAgentInfo("worker", parent);
+      await released(manager, info);
+      expect(manager.getAgentInfo("worker", parent).status).toBe("interrupted");
+      expect(fixture.instances[0].requests).toEqual([]);
+      expect(fixture.instances[0].shutdowns).toBe(1);
+      fixture = configureCoreFixture();
+      await manager.spawnAgent(spawnParams(parent, "sibling", "parent still alive"));
+      await released(manager, manager.getAgentInfo("sibling", parent));
+      expect(manager.readAgentResponse("sibling", parent).status).toBe("completed");
+    } finally { await manager.shutdown(); }
+  });
+
+  test("shutdown takes ownership of pending initialization and refuses all new submissions", async () => {
+    const gate = deferred();
+    fixture = configureCoreFixture({ startupGate: gate.promise });
+    const parent = "manager-shutdown-" + randomUUID();
+    const manager = new AgentManager();
+    const pending = manager.spawnAgent(spawnParams(parent, "worker", "must not run")).then(() => undefined, (error) => error);
+    try {
+      await waitUntil(() => fixture.instances[0]?.events.includes("session_start"));
+      const shutdown = manager.shutdown();
+      await expect(manager.spawnAgent(spawnParams(parent, "new", "must not run"))).rejects.toThrow(/abort|shut/i);
+      await expect(manager.sendMessage(parent, "worker", "must not run")).rejects.toThrow(/abort|shut/i);
+      gate.resolve();
+      await shutdown;
+      expect(await pending).toBeInstanceOf(Error);
+      expect(fixture.instances[0].inputs).toEqual([]);
+      expect(fixture.instances[0].shutdowns).toBe(1);
+      expect(manager["live"].size).toBe(0);
+      await expect(manager.spawnAgent(spawnParams(parent, "after", "must not run"))).rejects.toThrow(/abort|shut/i);
+    } finally { gate.resolve(); await pending; await manager.shutdown(); }
+  });
+
+  test("rejects concurrent resumes while one initialization is pending", async () => {
+    const parent = "concurrent-resume-" + randomUUID();
+    const manager = new AgentManager();
+    const gate = deferred();
+    try {
+      await manager.spawnAgent(spawnParams(parent, "worker", "first"));
+      const info = manager.getAgentInfo("worker", parent);
+      await released(manager, info);
+      fixture = configureCoreFixture({ startupGate: gate.promise });
+      const first = manager.sendMessage(parent, "worker", "hold resume");
+      await waitUntil(() => fixture.instances[0]?.events.includes("session_start"));
+      await expect(manager.sendMessage(parent, "worker", "duplicate")).rejects.toThrow(/starting|startup/i);
+      gate.resolve();
+      expect(await first).toEqual({ delivery: "prompt" });
+      expect(fixture.instances).toHaveLength(1);
+      expect(manager.getAgentInfo("worker", parent).messageCount).toBe(2);
+    } finally { gate.resolve(); await manager.shutdown(); }
+  });
+
+  test("a model-response deadline does not cover tool execution", async () => {
+    const parent = "tool-deadline-" + randomUUID();
+    const manager = new AgentManager({ modelResponseTimeoutMs: 50 });
+    try {
+      await manager.spawnAgent(spawnParams(parent, "worker", "tool hold"));
+      await waitUntil(() => fixture.instances[0]?.activeTools === 1);
+      await new Promise((resolve) => setTimeout(resolve, 100));
+      expect(manager.getAgentInfo("worker", parent).status).toBe("running");
+      await manager.interruptAgent(parent, "worker");
+      const info = manager.getAgentInfo("worker", parent);
+      await released(manager, info);
+      expect(fixture.instances[0].activeTools).toBe(0);
+      expect(fixture.instances[0].shutdowns).toBe(1);
+    } finally { await manager.shutdown(); }
+  });
+
+  test("times out an endlessly streaming assistant response and releases its native resources", async () => {
+    const parent = "response-deadline-" + randomUUID();
+    const completions: any[] = [];
+    const manager = new AgentManager({ modelResponseTimeoutMs: 80, onUnclaimedCompletion: (event) => completions.push(event) });
+    try {
+      await manager.spawnAgent(spawnParams(parent, "worker", "stream forever"));
+      const info = manager.getAgentInfo("worker", parent);
+      await released(manager, info);
+      expect(manager.readAgentResponse("worker", parent).error).toContain("Model response exceeded 80 ms");
+      expect(manager.getAgentInfo("worker", parent).status).toBe("failed");
+      expect(completions).toHaveLength(1);
+      expect(fixture.instances[0].activeStreams).toBe(0);
+      expect(fixture.instances[0].shutdowns).toBe(1);
+    } finally { await manager.shutdown(); }
+  });
+
+  test("stream observation is delta-only and cannot mutate the SDK's assistant message", async () => {
+    const parent = "delta-observer-" + randomUUID();
+    const manager = new AgentManager({ modelResponseTimeoutMs: 2000 });
+    try {
+      await manager.spawnAgent(spawnParams(parent, "worker", "stream forever"));
+      const info = manager.getAgentInfo("worker", parent);
+      const [sync, update] = await readSocketEvents(getSocketPath(info.id), 2);
+      expect(sync.status).toBe("calling");
+      expect(sync.partialMessage.content[0]).toMatchObject({ type: "toolCall", id: "stream-call", name: "fixture_hold" });
+      expect(update.type).toBe("message_update");
+      expect(update.message).toBeUndefined();
+      expect(update.assistantMessageEvent.partial).toBeUndefined();
+      expect(fixture.instances[0].requests[0].message.content).toEqual([
+        { type: "toolCall", id: "stream-call", name: "fixture_hold", arguments: {} },
+      ]);
+    } finally { await manager.shutdown(); }
+  });
+
+  test("observer exceptions stay outside native persistence and cannot skip cleanup", async () => {
+    const gate = deferred();
+    fixture = configureCoreFixture({ responseGate: gate.promise });
+    const parent = "observer-failure-" + randomUUID();
+    const errors: Error[] = [];
+    const manager = new AgentManager({ onError: (error) => errors.push(error) });
+    try {
+      await manager.spawnAgent(spawnParams(parent, "worker", "hold response"));
+      const info = manager.getAgentInfo("worker", parent);
+      const live = manager["live"].get(info.id)!;
+      const broadcast = live.broadcaster.broadcast.bind(live.broadcaster);
+      live.broadcaster.broadcast = (event: any) => {
+        if (event.type === "message_end" && event.message.role === "assistant") throw new Error("observer fixture failure");
+        broadcast(event);
+      };
+      gate.resolve();
+      await released(manager, info);
+      expect(sessionMessages(info).filter((message) => message.role === "assistant")).toHaveLength(1);
+      expect(errors.some((error) => error.message.includes("observer fixture failure"))).toBe(true);
+      expect(fixture.instances[0].shutdowns).toBe(1);
+    } finally { gate.resolve(); await manager.shutdown(); }
+  });
+
+  test("repeated runs leave no sessions, timers, sockets or extension work active", async () => {
+    const parent = "resource-cycles-" + randomUUID();
+    const manager = new AgentManager();
+    try {
+      await manager.spawnAgent(spawnParams(parent, "worker", "cycle zero"));
+      const info = manager.getAgentInfo("worker", parent);
+      for (let cycle = 0; cycle < 10; cycle++) {
+        if (cycle) await manager.sendMessage(parent, "worker", "cycle " + cycle);
+        const live = manager["live"].get(info.id);
+        await released(manager, info);
+        expect(manager["live"].size).toBe(0);
+        expect(live?.modelResponseTimer).toBeUndefined();
+        expect(live?.session?.["_eventListeners"]).toEqual([]);
+        expect(live?.session?.["_unsubscribeAgent"]).toBeUndefined();
+        expect(live?.broadcaster["server"]).toBeNull();
+        expect(live?.broadcaster["connections"]).toEqual([]);
+        expect(live?.logger["stream"]).toBeNull();
+        expect(fs.existsSync(activeMarker(info.id))).toBe(false);
+        if (process.platform !== "win32") expect(fs.existsSync(getSocketPath(info.id))).toBe(false);
+        expect(fs.existsSync(peekMarker(info.id))).toBe(false);
+      }
+      expect(fixture.instances).toHaveLength(10);
+      expect(fixture.instances.map((instance) => [instance.shutdowns, instance.activeStreams, instance.activeTools]))
+        .toEqual(Array.from({ length: 10 }, () => [1, 0, 0]));
+      expect(sessionMessages(info).filter((message) => message.role === "user")).toHaveLength(10);
+      expect(sessionMessages(info).filter((message) => message.role === "assistant")).toHaveLength(10);
+    } finally { await manager.shutdown(); }
+  });
+});
+
+describe("startup storage failures", () => {
   test("records startup failure causes instead of leaving agents starting", async () => {
-    process.env.PI_SUBAGENT_PI_BIN = FAKE_RPC_CHILD;
     const parentSessionId = "lifecycle-startup-failure";
     const scope = path.join(getRunsDir(), parentScopeKey(parentSessionId));
     // Marker files live in the isolated temp directory, not the Windows named-pipe namespace.
@@ -837,7 +977,7 @@ describe("child process lifecycle", () => {
       const failed = manager.getAgentInfo("worker", parentSessionId);
       expect(failed.status).toBe("failed");
       expect(failed.error).toBe(returnedError);
-      expect(failed.childProcess).toBeUndefined();
+      expect(manager["live"].has(failed.id)).toBe(false);
       expect((await manager.waitAllAgents(parentSessionId, ["worker"])).responses).toEqual([
         expect.objectContaining({ agent_name: "/worker", status: "failed", error: failed.error }),
       ]);
@@ -851,7 +991,6 @@ describe("child process lifecycle", () => {
       fs.mkdirSync(socketDir, { recursive: true });
       await manager.shutdown();
       fs.rmSync(scope, { recursive: true, force: true });
-      delete process.env.PI_SUBAGENT_PI_BIN;
     }
   });
 
@@ -884,41 +1023,12 @@ describe("child process lifecycle", () => {
     try {
       await manager.ready();
       expect(manager.getAgentInfo("orphan", parentSessionId)).toMatchObject({
-        status: "failed",
-        error: "Agent startup did not complete before its owning extension stopped.",
+        status: "interrupted",
+        messageCount: 0,
       });
     } finally {
       await manager.shutdown();
       fs.rmSync(scope, { recursive: true, force: true });
-    }
-  });
-
-  test("hibernates after failure while preserving the error", async () => {
-    process.env.PI_SUBAGENT_PI_BIN = FAKE_RPC_CHILD;
-    const parentSessionId = "lifecycle-failure";
-    const systemPromptFile = path.join(TEST_AGENT_DIR, "pi-codex-subagents", "SYSTEM.md");
-    const customSystemPrompt = "Use the custom subagent instructions.";
-    fs.rmSync(path.join(getRunsDir(), parentScopeKey(parentSessionId)), { recursive: true, force: true });
-    fs.mkdirSync(path.dirname(systemPromptFile), { recursive: true });
-    fs.writeFileSync(systemPromptFile, customSystemPrompt);
-    const manager = new AgentManager();
-    try {
-      await manager.spawnAgent(spawnParams(parentSessionId, "worker", "fail now"));
-      const started = manager.getAgentInfo("worker", parentSessionId);
-      const pid = started.childProcess!.pid;
-      expect(fs.readFileSync(systemPromptFile, "utf8")).toBe(customSystemPrompt);
-      await waitUntil(() => {
-        const info = manager.getAgentInfo("worker", parentSessionId);
-        return info.status === "failed" && !info.childProcess;
-      });
-      const failed = manager.readAgentResponse("worker", parentSessionId);
-      expect(failed.error).toBe("fake failure");
-      expect(pidAlive(pid)).toBe(false);
-    } finally {
-      await manager.shutdown();
-      fs.rmSync(path.join(getRunsDir(), parentScopeKey(parentSessionId)), { recursive: true, force: true });
-      fs.rmSync(systemPromptFile, { force: true });
-      delete process.env.PI_SUBAGENT_PI_BIN;
     }
   });
 
@@ -937,166 +1047,10 @@ describe("child process lifecycle", () => {
     }
   });
 
-  test.skipIf(process.platform === "win32")("accepts Darwin process ownership when ps cannot expose the token", async () => {
-    const platformDescriptor = Object.getOwnPropertyDescriptor(process, "platform")!;
-    Object.defineProperty(process, "platform", { ...platformDescriptor, value: "darwin" });
-    process.env.PI_SUBAGENT_PI_BIN = FAKE_RPC_CHILD;
-    const parentSessionId = "lifecycle-darwin";
-    fs.rmSync(path.join(getRunsDir(), parentScopeKey(parentSessionId)), { recursive: true, force: true });
-    const manager = new AgentManager();
-    try {
-      await manager.spawnAgent(spawnParams(parentSessionId, "worker", "hold darwin"));
-      const running = manager.getAgentInfo("worker", parentSessionId);
-      expect(running.childProcess?.pid).toBeNumber();
-      expect(pidAlive(running.childProcess!.pid)).toBe(true);
-    } finally {
-      try {
-        await manager.shutdown();
-      } finally {
-        Object.defineProperty(process, "platform", platformDescriptor);
-        fs.rmSync(path.join(getRunsDir(), parentScopeKey(parentSessionId)), { recursive: true, force: true });
-        delete process.env.PI_SUBAGENT_PI_BIN;
-      }
-    }
-  });
-
-  test("broadcasts delta-only tool-call progress instead of reporting thinking", async () => {
-    process.env.PI_SUBAGENT_PI_BIN = FAKE_RPC_CHILD;
-    const parentSessionId = "lifecycle-delta-only-progress";
-    const scope = path.join(getRunsDir(), parentScopeKey(parentSessionId));
-    fs.rmSync(scope, { recursive: true, force: true });
-    const manager = new AgentManager({ modelResponseTimeoutMs: 2000 });
-    try {
-      await manager.spawnAgent(spawnParams(parentSessionId, "worker", "stream forever"));
-      await new Promise((resolve) => setTimeout(resolve, 30));
-      const running = manager.getAgentInfo("worker", parentSessionId);
-      const [sync, update] = await readSocketEvents(getSocketPath(running.id), 2);
-      expect(sync.status).toBe("calling");
-      expect(sync.partialMessage.content[0]).toMatchObject({ type: "toolCall" });
-      expect(update.type).toBe("message_update");
-      expect(update.message).toBeUndefined();
-
-      const persistedActivity = manager.getAgentInfo("worker", parentSessionId).updatedAt;
-      await new Promise((resolve) => setTimeout(resolve, 30));
-      expect(manager.getAgentInfo("worker", parentSessionId).updatedAt).toBe(persistedActivity);
-    } finally {
-      await manager.interruptAgent(parentSessionId, "worker");
-      await manager.shutdown();
-      fs.rmSync(scope, { recursive: true, force: true });
-      delete process.env.PI_SUBAGENT_PI_BIN;
-    }
-  });
-
-  test("does not apply the model response timeout to tool execution", async () => {
-    process.env.PI_SUBAGENT_PI_BIN = FAKE_RPC_CHILD;
-    const parentSessionId = "lifecycle-tool-timeout";
-    const scope = path.join(getRunsDir(), parentScopeKey(parentSessionId));
-    fs.rmSync(scope, { recursive: true, force: true });
-    const manager = new AgentManager({ modelResponseTimeoutMs: 50 });
-    try {
-      await manager.spawnAgent(spawnParams(parentSessionId, "worker", "tool hold"));
-      const pid = manager.getAgentInfo("worker", parentSessionId).childProcess!.pid;
-      await new Promise((resolve) => setTimeout(resolve, 100));
-      expect(manager.getAgentInfo("worker", parentSessionId).status).toBe("running");
-      expect(pidAlive(pid)).toBe(true);
-    } finally {
-      await manager.interruptAgent(parentSessionId, "worker");
-      await manager.shutdown();
-      fs.rmSync(scope, { recursive: true, force: true });
-      delete process.env.PI_SUBAGENT_PI_BIN;
-    }
-  });
-
-  test("fails and terminates a model response that streams forever", async () => {
-    process.env.PI_SUBAGENT_PI_BIN = FAKE_RPC_CHILD;
-    const parentSessionId = "lifecycle-model-response-timeout";
-    const scope = path.join(getRunsDir(), parentScopeKey(parentSessionId));
-    fs.rmSync(scope, { recursive: true, force: true });
-    const manager = new AgentManager({ modelResponseTimeoutMs: 50 });
-    try {
-      await manager.spawnAgent(spawnParams(parentSessionId, "worker", "stream forever"));
-      const pid = manager.getAgentInfo("worker", parentSessionId).childProcess!.pid;
-      await waitUntil(() => {
-        const info = manager.getAgentInfo("worker", parentSessionId);
-        return info.status === "failed" && !info.childProcess;
-      });
-      expect(manager.readAgentResponse("worker", parentSessionId).error).toContain("Model response exceeded 50 ms");
-      expect(pidAlive(pid)).toBe(false);
-    } finally {
-      await manager.shutdown();
-      fs.rmSync(scope, { recursive: true, force: true });
-      delete process.env.PI_SUBAGENT_PI_BIN;
-    }
-  });
-
-  test("interrupt terminates the child and clears runtime artifacts", async () => {
-    process.env.PI_SUBAGENT_PI_BIN = FAKE_RPC_CHILD;
-    const parentSessionId = "lifecycle-interrupt";
-    fs.rmSync(path.join(getRunsDir(), parentScopeKey(parentSessionId)), { recursive: true, force: true });
-    const manager = new AgentManager();
-    try {
-      await manager.spawnAgent(spawnParams(parentSessionId, "worker", "hold interrupt"));
-      const running = manager.getAgentInfo("worker", parentSessionId);
-      const pid = running.childProcess!.pid;
-      expect((await manager.interruptAgent(parentSessionId, "worker")).previous_status).toBe("running");
-      const interrupted = manager.getAgentInfo("worker", parentSessionId);
-      expect(interrupted.status).toBe("interrupted");
-      expect(interrupted.childProcess).toBeUndefined();
-      expect(pidAlive(pid)).toBe(false);
-      const socketDir = path.join(process.env.PI_SUBAGENT_TEMP_DIR!, "pi-codex-subagents", os.userInfo().username, "sockets");
-      expect(fs.existsSync(path.join(socketDir, `${running.id}.active.json`))).toBe(false);
-      expect(fs.existsSync(path.join(socketDir, `${running.id}.peek.json`))).toBe(false);
-      if (process.platform !== "win32") expect(fs.existsSync(getSocketPath(running.id))).toBe(false);
-    } finally {
-      await manager.shutdown();
-      fs.rmSync(path.join(getRunsDir(), parentScopeKey(parentSessionId)), { recursive: true, force: true });
-      delete process.env.PI_SUBAGENT_PI_BIN;
-    }
-  });
-
-  test("reconciles owned children without risking PID-reuse kills", async () => {
-    process.env.PI_SUBAGENT_PI_BIN = FAKE_RPC_CHILD;
-    const parentSessionId = "lifecycle-reconcile";
-    fs.rmSync(path.join(getRunsDir(), parentScopeKey(parentSessionId)), { recursive: true, force: true });
-    const owner = new AgentManager();
-    const reconcilers: Array<InstanceType<typeof AgentManager>> = [];
-    try {
-      await owner.spawnAgent(spawnParams(parentSessionId, "orphan", "hold orphan"));
-      const orphanPid = owner.getAgentInfo("orphan", parentSessionId).childProcess!.pid;
-      const reconciler = new AgentManager();
-      reconcilers.push(reconciler);
-      await waitUntil(() => {
-        const info = reconciler.getAgentInfo("orphan", parentSessionId);
-        return info.status === "interrupted" && !info.childProcess;
-      });
-      await waitUntil(() => !pidAlive(orphanPid));
-      expect(pidAlive(orphanPid)).toBe(false);
-
-      await owner.spawnAgent(spawnParams(parentSessionId, "pid-reuse", "hold identity"));
-      const mismatched = owner.getAgentInfo("pid-reuse", parentSessionId);
-      const mismatchedPid = mismatched.childProcess!.pid;
-      mismatched.childProcess!.processIdentity = "not-the-owned-process";
-      fs.writeFileSync(mismatched.infoFile, JSON.stringify(mismatched, null, 2));
-      const mismatchReconciler = new AgentManager();
-      reconcilers.push(mismatchReconciler);
-      await waitUntil(() => {
-        const info = mismatchReconciler.getAgentInfo("pid-reuse", parentSessionId);
-        return info.status === "interrupted" && !info.childProcess;
-      });
-      expect(pidAlive(mismatchedPid)).toBe(true);
-      await owner.shutdown();
-      expect(pidAlive(mismatchedPid)).toBe(false);
-    } finally {
-      await Promise.all([owner.shutdown(), ...reconcilers.map((manager) => manager.shutdown())]);
-      fs.rmSync(path.join(getRunsDir(), parentScopeKey(parentSessionId)), { recursive: true, force: true });
-      delete process.env.PI_SUBAGENT_PI_BIN;
-    }
-  });
 });
 
 describe("completion delivery", () => {
-  test("publishes unclaimed settled and abnormal-exit completions", async () => {
-    process.env.PI_SUBAGENT_PI_BIN = FAKE_RPC_CHILD;
+  test("publishes unclaimed successful and failed completions", async () => {
     const parentSessionId = "completion-callbacks";
     const scope = path.join(getRunsDir(), parentScopeKey(parentSessionId));
     fs.rmSync(scope, { recursive: true, force: true });
@@ -1115,16 +1069,14 @@ describe("completion delivery", () => {
       await waitUntil(() => completions.some((event) => event.agentName === "/crashed"));
       expect(completions.filter((event) => event.agentName === "/crashed")).toHaveLength(1);
       expect(completions.find((event) => event.agentName === "/crashed")).toMatchObject({ status: "failed" });
-      expect(completions.find((event) => event.agentName === "/crashed").error).toContain("code=23");
+      expect(completions.find((event) => event.agentName === "/crashed").error).toContain("fixture failure");
     } finally {
       await manager.shutdown();
       fs.rmSync(scope, { recursive: true, force: true });
-      delete process.env.PI_SUBAGENT_PI_BIN;
     }
   });
 
   test("suppresses automatic delivery while wait tools claim completions", async () => {
-    process.env.PI_SUBAGENT_PI_BIN = FAKE_RPC_CHILD;
     const parentSessionId = "completion-waits";
     const scope = path.join(getRunsDir(), parentScopeKey(parentSessionId));
     fs.rmSync(scope, { recursive: true, force: true });
@@ -1143,12 +1095,10 @@ describe("completion delivery", () => {
     } finally {
       await manager.shutdown();
       fs.rmSync(scope, { recursive: true, force: true });
-      delete process.env.PI_SUBAGENT_PI_BIN;
     }
   });
 
   test("releases suppressed completions when wait_all_agents is cancelled", async () => {
-    process.env.PI_SUBAGENT_PI_BIN = FAKE_RPC_CHILD;
     const parentSessionId = "completion-wait-cancel";
     const scope = path.join(getRunsDir(), parentScopeKey(parentSessionId));
     fs.rmSync(scope, { recursive: true, force: true });
@@ -1168,12 +1118,10 @@ describe("completion delivery", () => {
     } finally {
       await manager.shutdown();
       fs.rmSync(scope, { recursive: true, force: true });
-      delete process.env.PI_SUBAGENT_PI_BIN;
     }
   });
 
   test("reports active and inactive lifecycle transitions", async () => {
-    process.env.PI_SUBAGENT_PI_BIN = FAKE_RPC_CHILD;
     const parentSessionId = "status-transitions";
     const scope = path.join(getRunsDir(), parentScopeKey(parentSessionId));
     fs.rmSync(scope, { recursive: true, force: true });
@@ -1191,13 +1139,15 @@ describe("completion delivery", () => {
 
       const settled = manager.getAgentInfo("worker", parentSessionId);
       const rejectedAt = activity.length;
-      await expect(manager.sendMessage(parentSessionId, "worker", "reject restart")).rejects.toThrow("fake prompt rejection");
+      const rejection = spyOn(codingAgent.AgentSession.prototype, "prompt").mockRejectedValueOnce(new Error("fixture prompt rejection"));
+      try { await expect(manager.sendMessage(parentSessionId, "worker", "reject restart")).rejects.toThrow("fixture prompt rejection"); }
+      finally { rejection.mockRestore(); }
       expect(manager.getAgentInfo("worker", parentSessionId)).toMatchObject({
         status: "completed",
         finalResponse: settled.finalResponse,
         completedAt: settled.completedAt,
       });
-      expect(manager.getAgentInfo("worker", parentSessionId).childProcess).toBeUndefined();
+      expect(manager["live"].has(settled.id)).toBe(false);
       expect(activity.slice(rejectedAt)).toContain(true);
       expect(activity.at(-1)).toBe(false);
 
@@ -1209,14 +1159,13 @@ describe("completion delivery", () => {
     } finally {
       await manager.shutdown();
       fs.rmSync(scope, { recursive: true, force: true });
-      delete process.env.PI_SUBAGENT_PI_BIN;
     }
   });
 });
 
 describe("extension completion delivery and TUI", () => {
   test("collects native codemode renderers through the real extension API without registering or activating another tool", async () => {
-    const { default: subagentExtension } = await import("./index.js");
+    const { default: subagentExtension } = await import("../src/index.js");
     const accesses: PropertyKey[] = [];
     let collected: ToolRenderers | undefined;
     const loader = new codingAgent.DefaultResourceLoader({
@@ -1285,6 +1234,7 @@ describe("extension completion delivery and TUI", () => {
       const ctx: any = {
         mode: "tui", sessionManager: { getSessionId: () => parentId },
         ui: {
+          setWidget() {},
           async custom(create: any) {
             const component = create({ terminal: { rows: 80 }, requestRender() {} },
               { fg: (_color: string, text: string) => text, bold: (text: string) => text }, {}, () => {});
@@ -1326,7 +1276,7 @@ describe("extension completion delivery and TUI", () => {
       const loader = new DefaultResourceLoader({
         cwd: ${JSON.stringify(agentDir)}, agentDir: ${JSON.stringify(agentDir)},
         settingsManager: SettingsManager.inMemory({}),
-        additionalExtensionPaths: [${JSON.stringify(path.join(import.meta.dir, "index.ts"))}],
+        additionalExtensionPaths: [${JSON.stringify(path.join(import.meta.dir, "..", "src", "index.ts"))}],
         noExtensions: true, noSkills: true, noPromptTemplates: true, noThemes: true, noContextFiles: true,
       });
       try {
@@ -1344,7 +1294,7 @@ describe("extension completion delivery and TUI", () => {
     `;
     try {
       const probe = spawnSync(process.execPath, ["--eval", source], {
-        cwd: import.meta.dir, encoding: "utf8", timeout: 30_000,
+        cwd: path.resolve(import.meta.dir, ".."), encoding: "utf8", timeout: 30_000,
         env: { ...process.env, PI_CODING_AGENT_DIR: agentDir, PI_SUBAGENT_TEMP_DIR: agentDir },
       });
       if (probe.status !== 0) throw new Error(`Pi file-loader check failed: ${probe.error ?? probe.stderr}`);
@@ -1368,6 +1318,7 @@ describe("extension completion delivery and TUI", () => {
       mode: "tui",
       sessionManager: { getSessionId: () => "shortcut-test-parent" },
       ui: {
+        setWidget() {},
         async custom(create: any) {
           const theme = { fg: (_color: string, text: string) => text, bold: (text: string) => text };
           const menu = create({ requestRender() {} }, theme, {}, () => {});
@@ -1381,7 +1332,7 @@ describe("extension completion delivery and TUI", () => {
         },
       },
     };
-    const { default: subagentExtension } = await import("./index.js");
+    const { default: subagentExtension } = await import("../src/index.js");
     try {
       await subagentExtension({
         on(name: string, handler: any) { if (name === "session_shutdown") shutdown = handler; },
@@ -1432,7 +1383,7 @@ describe("extension completion delivery and TUI", () => {
       };
       const commands = new Map<string, any>();
       let shutdown: (() => Promise<void>) | undefined;
-      const { default: subagentExtension } = await import("./index.js");
+      const { default: subagentExtension } = await import("../src/index.js");
 
       const originalList = AgentManager.prototype.listAgents;
       const originalInfo = AgentManager.prototype.getAgentInfo;
@@ -1451,7 +1402,7 @@ describe("extension completion delivery and TUI", () => {
         fg(_color: string, text: string) { return this.ansi ? `${this.ansi}${text}\x1b[0m` : text; },
         bold: (text: string) => text,
       };
-      const ctx: any = { mode: "tui", sessionManager: { getSessionId: () => parentId }, ui: { notify } };
+      const ctx: any = { mode: "tui", sessionManager: { getSessionId: () => parentId }, ui: { notify, setWidget() {} } };
       const fixture = {
         parentId, otherId, put, list, selections, opened, ctx, theme, requestRender, notify,
         tui: { terminal: { rows: 40 }, requestRender } as any,
@@ -1678,7 +1629,7 @@ describe("extension completion delivery and TUI", () => {
         const own = f.put("same", { modelId: "own-model" });
         const other = f.put("same", { modelId: "other-model" }, f.otherId);
         const before = [own, other].map((info) => fs.readFileSync(info.infoFile, "utf8"));
-        const controlNames = ["spawnAgent", "sendMessage", "interruptAgent", "sendCommand"] as const;
+        const controlNames = ["spawnAgent", "sendMessage", "interruptAgent"] as const;
         const originals = controlNames.map((name) => (AgentManager.prototype as any)[name]);
         const controls = controlNames.map((name) => {
           const control = mock(() => { throw new Error(`Browser must not call ${name}`); });
@@ -1799,7 +1750,6 @@ describe("extension completion delivery and TUI", () => {
   });
 
   test("registers commands, renders one-line activity, and delivers bounded completions", async () => {
-    process.env.PI_SUBAGENT_PI_BIN = FAKE_RPC_CHILD;
     const handlers = new Map<string, Array<(event: any, ctx: any) => any>>();
     const tools = new Map<string, any>();
     const commands = new Map<string, any>();
@@ -1852,8 +1802,8 @@ describe("extension completion delivery and TUI", () => {
     const modelOnlyTemplateFile = path.join(TEST_AGENT_DIR, "pi-codex-subagents", "agents", "current-parent.md");
     fs.writeFileSync(modelOnlyTemplateFile, "---\nname: current-parent\nmodel: template-model\n---\n");
     // A thinking suffix on an allowlist entry is tolerated and stripped from the offered pair.
-    fs.writeFileSync(configFile, JSON.stringify({ models: ["test/fake:high", "typo/nope"], modelsFromEnabledModels: true }));
-    const { default: subagentExtension } = await import("./index.js");
+    fs.writeFileSync(configFile, JSON.stringify({ defaults: { extensions: [CORE_SDK_EXTENSION] }, models: ["test/fake:high", "typo/nope"], modelsFromEnabledModels: true }));
+    const { default: subagentExtension } = await import("../src/index.js");
     await subagentExtension(pi);
     const emit = async (name: string, event: any = {}) => {
       for (const handler of handlers.get(name) ?? []) await handler(event, ctx);
@@ -1989,7 +1939,7 @@ describe("extension completion delivery and TUI", () => {
         .rejects.toThrow(/not currently available/);
 
       // Unconfigured takes both runtime arguments away again even though Pi still has enabledModels.
-      fs.writeFileSync(configFile, "{}");
+      fs.writeFileSync(configFile, JSON.stringify({ defaults: { extensions: [CORE_SDK_EXTENSION] } }));
       await emit("session_start", { reason: "restart" });
       expect(spawnArgs().model).toBeUndefined();
       expect(spawnArgs().thinking).toBeUndefined();
@@ -2020,7 +1970,6 @@ describe("extension completion delivery and TUI", () => {
       fs.rmSync(scope, { recursive: true, force: true });
       fs.rmSync(configFile, { force: true });
       fs.rmSync(modelOnlyTemplateFile, { force: true });
-      delete process.env.PI_SUBAGENT_PI_BIN;
     }
   });
 });
@@ -2064,7 +2013,7 @@ describe("observer broadcast", () => {
     await once(broadcaster["server"]!, "listening");
     const socket = net.connect(getSocketPath(agentId));
     sockets.push(socket);
-    const decoder = new RpcJsonlDecoder();
+    const decoder = new ObserverJsonlDecoder();
     socket.on("data", (chunk) => {
       for (const line of decoder.push(chunk)) events.push(JSON.parse(line));
     });
@@ -2211,10 +2160,9 @@ describe("observer broadcast", () => {
     expect((await flush()).filter((event) => event.parentToolCallId)).toEqual([]);
   });
 
-  test("forwards non-execution lifecycle/RPC events even when they carry parent metadata", async () => {
+  test("forwards non-execution lifecycle events even when they carry parent metadata", async () => {
     const values = [
       { type: "agent_start" },
-      { type: "response", id: "rpc", success: false, error: "expected" },
       { type: "message_start", message: { role: "user", content: "task" } },
       { type: "message_end", message: { role: "toolResult", toolCallId: "unknown" } },
       { type: "agent_end", messages: [] },
@@ -2263,73 +2211,6 @@ describe("observer broadcast", () => {
     const sync = await snapshot();
     expect(sync).toMatchObject({ status: "done", activeTools: [], partialMessage: null, userMessage: null });
     expect(sync.toolName).toBeUndefined();
-  });
-
-  test("keeps raw nested RPC activity, completion delivery, response reads and waits in AgentManager", async () => {
-    const completions: any[] = [];
-    const manager = new AgentManager({ onUnclaimedCompletion: (event) => completions.push(event) });
-    const terminate = mock(async () => {});
-    manager["terminateProcess"] = terminate;
-    await manager.ready();
-    const parentSessionId = `observer-${agentId}`;
-    const scope = path.join(getRunsDir(), parentScopeKey(parentSessionId));
-    fs.mkdirSync(scope, { recursive: true });
-    const info: AgentInfo = {
-      id: agentId, taskName: "observer", canonicalName: "/observer", parentSessionId,
-      provider: "test", modelId: "fake", model: "test:fake", cwd: TEST_AGENT_DIR,
-      sessionFile: path.join(scope, `${agentId}.jsonl`),
-      infoFile: path.join(scope, `${agentId}.info.json`),
-      logFile: path.join(scope, `${agentId}.log`),
-      createdAt: Date.now(), updatedAt: Date.now(), messageCount: 0, status: "starting",
-    };
-    const live: any = {
-      info, broadcaster, logger: { info() {} }, pending: new Map(),
-      lastActivityPersistedAt: 0, finalizedRun: false, expectedExit: false,
-    };
-    const receive = (...values: any[]) => {
-      const decoder = new RpcJsonlDecoder();
-      const data = Buffer.from(values.map((event) => JSON.stringify(event) + "\n").join(""));
-      for (const chunk of [data.subarray(0, 7), data.subarray(7)]) {
-        for (const line of decoder.push(chunk)) manager["handleLine"](live, line);
-      }
-    };
-    try {
-      for (const event of [
-        nested(start("parent/1", "read"), "parent"),
-        nested(update("parent/1", textResult("nested progress")), "parent"),
-        nested(end("parent/1", textResult("nested error"), true), "parent"),
-      ]) {
-        live.info.status = "starting";
-        live.lastActivityPersistedAt = 0;
-        receive(event);
-        expect(JSON.parse(fs.readFileSync(info.infoFile, "utf8"))).toMatchObject({
-          status: "running", lastActivity: live.info.lastActivity,
-        });
-      }
-      expect(await flush()).toEqual([]);
-      const resolve = mock(() => {});
-      live.pending.set("rpc", { resolve, reject: mock(), timer: setTimeout(() => {}, 5000) });
-      receive({ type: "response", id: "rpc", success: true, data: { ok: true }, parentToolCallId: "metadata" });
-      expect(resolve).toHaveBeenCalledWith({ ok: true });
-      expect(live.pending.size).toBe(0);
-
-      receive({ type: "message_end", message: { role: "assistant", content: [{ type: "text", text: "final response" }], stopReason: "stop" } },
-        { type: "agent_settled" });
-      expect(completions).toHaveLength(1);
-      expect(completions[0]).toMatchObject({ status: "completed", finalResponse: "final response" });
-      expect(terminate).toHaveBeenCalledTimes(1);
-      expect(manager.readAgentResponse("observer", parentSessionId)).toMatchObject({
-        status: "completed", finalResponse: "final response",
-      });
-      expect((await manager.waitAgent(parentSessionId, ["observer"])).event).toMatchObject({ status: "completed" });
-      expect((await manager.waitAllAgents(parentSessionId, ["observer"])).responses)
-        .toEqual([expect.objectContaining({ status: "completed", finalResponse: "final response" })]);
-      expect((await snapshot()).activeTools).toEqual([]);
-    } finally {
-      for (const pending of live.pending.values()) clearTimeout(pending.timer);
-      await manager.shutdown();
-      fs.rmSync(scope, { recursive: true, force: true });
-    }
   });
 
   test.each(["regular", "fullscreen"] as const)("isolated native %s TUI handles live socket previews, input, reopen, resize and offline recovery", async (mode) => {
@@ -2540,7 +2421,7 @@ describe("observer broadcast", () => {
       overlays.push(overlay);
       const socket = overlay["socket"]!;
       sockets.push(socket);
-      const decoder = new RpcJsonlDecoder();
+      const decoder = new ObserverJsonlDecoder();
       let synced = false;
       const onData = (chunk: Buffer) => {
         for (const line of decoder.push(chunk)) {
@@ -2727,697 +2608,1195 @@ describe("context usage formatting", () => {
   });
 });
 
-describe("context usage sampling", () => {
-  const initialUsage = { tokens: 50000, contextWindow: 500000, percent: 10 };
-  const nextUsage = { tokens: 60000, contextWindow: 500000, percent: 12 };
-  let manager: InstanceType<typeof AgentManager>;
-  let info: AgentInfo;
-  let live: any;
-  let commands: any[];
-  const tick = () => new Promise((resolve) => setTimeout(resolve, 0));
-  const emit = (event: any) => manager["handleLine"](live, JSON.stringify(event));
-  const reply = (command: any, data: any, success = true) => emit({
-    type: "response", id: command.id, success, data, error: success ? undefined : "statistics unavailable",
+describe("SDK business scope, waits and resources", () => {
+  test("identical task names stay parent-scoped; all-sessions is only a read view", async () => {
+    const parentA = "scope-a-" + randomUUID();
+    const parentB = "scope-b-" + randomUUID();
+    const manager = new AgentManager();
+    try {
+      await Promise.all([
+        manager.spawnAgent(spawnParams(parentA, "/review/api/", "hold a")),
+        manager.spawnAgent(spawnParams(parentB, "review/api", "hold b")),
+      ]);
+      const a = manager.getAgentInfo("review/api", parentA);
+      const b = manager.getAgentInfo("review/api", parentB);
+      expect(a.id).not.toBe(b.id);
+      expect(a.sessionFile).not.toBe(b.sessionFile);
+      expect(manager.listAgents("review/", parentA)).toEqual([
+        expect.objectContaining({ agent_name: "/review/api", agent_status: "running", last_task_message: "hold a" }),
+      ]);
+      const all = manager.listAgents(undefined, parentA, true).filter((entry) => [parentA, parentB].includes(entry.parent_session_id!));
+      expect(all).toHaveLength(2);
+      expect(new Set(all.map((entry) => entry.parent_session_id))).toEqual(new Set([parentA, parentB]));
+      await expect(manager.sendMessage("unrelated", "review/api", "must not deliver")).rejects.toThrow("Agent not found");
+      await expect(manager.interruptAgent("unrelated", "review/api")).rejects.toThrow("Agent not found");
+      await expect(manager.spawnAgent(spawnParams(parentA, "review/api", "duplicate"))).rejects.toThrow(/already exists/);
+      await manager.interruptAgent(parentA, "review/api");
+      expect(manager.getAgentInfo("review/api", parentB).status).toBe("running");
+      expect((await manager.waitAgent(parentA, ["review/api"])).event?.status).toBe("interrupted");
+      expect(fixture.instances[1].shutdowns).toBe(0);
+    } finally { await manager.shutdown(); }
   });
-  const refresh = () => manager["requestContextRefresh"](live);
 
-  beforeEach(async () => {
-    manager = new AgentManager();
-    await manager.ready();
-    const parentSessionId = `context-unit-${randomUUID()}`;
-    const directory = path.join(getRunsDir(), parentScopeKey(parentSessionId));
-    fs.mkdirSync(directory, { recursive: true });
-    const id = randomUUID();
-    info = {
-      id, taskName: "worker", canonicalName: "/worker", parentSessionId,
-      provider: "test", modelId: "fake", model: "test:fake", cwd: TEST_AGENT_DIR,
-      infoFile: path.join(directory, `${id}.info.json`),
-      sessionFile: path.join(directory, `${id}.jsonl`), logFile: path.join(directory, `${id}.log`),
-      createdAt: 1, updatedAt: 1, lastActivity: 1, messageCount: 1, status: "running",
-      contextUsage: { ...initialUsage },
-      childProcess: { pid: -1, processIdentity: "fixture", token: randomUUID(), ownerPid: process.pid, startedAt: 1 },
+  test("read is non-consuming, wait cancellation leaves work alive, and default wait-all targets do not cross parents", async () => {
+    const parent = "wait-contract-" + randomUUID();
+    const other = "wait-other-" + randomUUID();
+    const completions: any[] = [];
+    const manager = new AgentManager({ onUnclaimedCompletion: (event) => completions.push(event) });
+    const controller = new AbortController();
+    try {
+      await manager.spawnAgent(spawnParams(parent, "one", "first"));
+      const info = manager.getAgentInfo("one", parent);
+      await released(manager, info);
+      const first = manager.readAgentResponse("one", parent);
+      expect(manager.readAgentResponse("one", parent)).toEqual(first);
+      expect(completions).toHaveLength(1);
+      expect((await manager.waitAgent(parent, ["one"])).event?.id).toBe(completions[0].id);
+      expect(manager.readAgentResponse("one", parent)).toEqual(first);
+      await manager.spawnAgent(spawnParams(parent, "two", "hold waiting"));
+      await manager.spawnAgent(spawnParams(other, "foreign", "hold other"));
+      const waiting = manager.waitAgent(parent, ["two"], controller.signal);
+      controller.abort();
+      await expect(waiting).rejects.toThrow(/abort/i);
+      expect(manager.getAgentInfo("two", parent).status).toBe("running");
+      expect(manager.getAgentInfo("foreign", other).status).toBe("running");
+      await manager.interruptAgent(parent, "two");
+      const all = await manager.waitAllAgents(parent);
+      expect(all.responses).toEqual([]); // Interrupt removes its name from implicit wait-all targets.
+      expect((await manager.waitAllAgents(parent, ["two"])).responses).toEqual([expect.objectContaining({ agent_name: "/two", status: "interrupted" })]);
+      expect(manager.getAgentInfo("foreign", other).status).toBe("running");
+      expect(completions).toHaveLength(1);
+    } finally { await manager.shutdown(); }
+  });
+
+  test("a second manager can observe but cannot take over an active SDK session file", async () => {
+    const parent = "external-owner-" + randomUUID();
+    const owner = new AgentManager();
+    const observer = new AgentManager();
+    try {
+      await owner.spawnAgent(spawnParams(parent, "worker", "hold owner"));
+      const info = owner.getAgentInfo("worker", parent);
+      await observer.ready();
+      expect(observer.readAgentResponse("worker", parent).status).toBe("running");
+      await expect(observer.sendMessage(parent, "worker", "must not reopen")).rejects.toThrow(/active in another host/);
+      await expect(observer.interruptAgent(parent, "worker")).rejects.toThrow(/active in another host/);
+      expect(owner.getAgentInfo("worker", parent).status).toBe("running");
+      expect(fixture.instances).toHaveLength(1);
+      await observer.shutdown();
+      expect(owner["live"].has(info.id)).toBe(true);
+    } finally { await Promise.all([owner.shutdown(), observer.shutdown()]); }
+  });
+
+  test("passes only its SYSTEM path and explicitly resolved template/skill resources, with fresh context", async () => {
+    const parent = "resource-policy-" + randomUUID();
+    const root = fs.mkdtempSync(path.join(TEST_AGENT_DIR, "resources-"));
+    const cwd = path.join(root, "project", "nested");
+    fs.mkdirSync(cwd, { recursive: true });
+    const ownSystem = path.join(TEST_AGENT_DIR, "pi-codex-subagents", "SYSTEM.md");
+    const literalTarget = path.join(root, "literal-target.md");
+    fs.writeFileSync(literalTarget, "FORBIDDEN_SECOND_SYSTEM_READ");
+    fs.writeFileSync(ownSystem, literalTarget);
+    const files: string[] = [];
+    const put = (file: string, content: string) => {
+      fs.mkdirSync(path.dirname(file), { recursive: true });
+      fs.writeFileSync(file, content);
+      files.push(file);
     };
-    fs.writeFileSync(info.infoFile, JSON.stringify(info));
-    commands = [];
-    let resolveExit!: () => void;
-    live = {
-      info, proc: { stdin: {
-        write(payload: string, callback: (error?: Error) => void) { commands.push(JSON.parse(payload)); callback(); },
-        end() { live.processFinished = true; resolveExit(); },
-      } },
-      pending: new Map(), reqId: 0, stderr: "", expectedExit: false, processFinished: false,
-      finalizedRun: false, awaitingPrompt: false, candidateResponse: "", lastActivityPersistedAt: 1,
-      contextEpoch: 0, contextRefreshDirty: false, logger: { info: mock(() => {}) },
-      broadcaster: { broadcast: mock(() => {}) },
-      exitPromise: new Promise<void>((resolve) => { resolveExit = resolve; }),
-    };
-    manager["live"].set(info.id, live);
-  });
-
-  afterEach(async () => {
-    live.processFinished = true;
-    for (const pending of live.pending.values()) {
-      clearTimeout(pending.timer);
-      pending.reject(new Error("fixture disposed"));
-    }
-    live.pending.clear();
-    await live.contextRefresh;
-    manager["live"].delete(info.id);
-    await manager.shutdown();
-    fs.rmSync(path.dirname(info.infoFile), { recursive: true, force: true });
-  });
-
-  test("samples only native current usage and leaves lifecycle and activity untouched", async () => {
-    refresh();
-    expect(commands.map((command) => command.type)).toEqual(["get_session_stats"]);
-    reply(commands[0], { tokens: { total: 110000, cacheRead: 90000 }, contextUsage: nextUsage });
-    await live.contextRefresh;
-    const saved = readInfoFile(info.infoFile)!;
-    expect(saved.contextUsage).toEqual(nextUsage);
-    expect(formatContextUsage(saved.contextUsage)).toBe("12%/500k");
-    expect(saved).toMatchObject({ status: "running", lastActivity: 1, messageCount: 1, childProcess: info.childProcess });
-    expect(live.info.contextUsage).toEqual(nextUsage);
-    expect(live.contextRefresh).toBeUndefined();
-    const updatedAt = saved.updatedAt;
-    refresh();
-    reply(commands[1], { contextUsage: nextUsage });
-    await live.contextRefresh;
-    expect(readInfoFile(info.infoFile)?.updatedAt).toBe(updatedAt);
-  });
-
-  test("coalesces message and turn bursts into one in-flight request and one follow-up", async () => {
-    for (const role of ["user", "assistant", "toolResult", "system", "custom"]) {
-      emit({ type: "message_end", message: { role, content: [] } });
-    }
-    emit({ type: "turn_end" });
-    emit({ type: "entry_appended", entry: { type: "message" } });
-    emit({ type: "entry_appended", entry: { type: "custom_message" } });
-    expect(commands).toHaveLength(1);
-    expect(live.pending.size).toBe(1);
-    reply(commands[0], { contextUsage: nextUsage });
-    await tick();
-    expect(commands).toHaveLength(2);
-    expect(live.pending.size).toBe(1);
-    reply(commands[1], { contextUsage: nextUsage });
-    await live.contextRefresh;
-    const updatedAt = readInfoFile(info.infoFile)?.updatedAt;
-    live.lastActivityPersistedAt = Date.now();
-    for (let index = 0; index < 50; index++) {
-      emit({ type: "message_update", assistantMessageEvent: { type: "text_delta", delta: "x" } });
-      emit({ type: "tool_execution_update" });
-      emit({ type: "queue_update" });
-      emit({ type: "entry_appended", entry: { type: "custom" } });
-    }
-    expect(commands).toHaveLength(2);
-    expect(readInfoFile(info.infoFile)?.updatedAt).toBe(updatedAt);
-  });
-
-  test("distinguishes rejected, timed-out, missing and valid unknown statistics", async () => {
-    refresh();
-    reply(commands[0], undefined, false);
-    await live.contextRefresh;
-    expect(readInfoFile(info.infoFile)?.contextUsage).toEqual(initialUsage);
-    refresh();
-    await live.contextRefresh; // Real sendCommand timeout, no automatic retry.
-    expect(commands).toHaveLength(2);
-    expect(readInfoFile(info.infoFile)?.contextUsage).toEqual(initialUsage);
-    await tick();
-    expect(commands).toHaveLength(2);
-    refresh();
-    reply(commands[2], { tokens: { total: 1000000 } });
-    await live.contextRefresh;
-    expect(readInfoFile(info.infoFile)?.contextUsage).toBeUndefined();
-    expect(live.info.contextUsage).toBeUndefined();
-    refresh();
-    reply(commands[3], { contextUsage: { tokens: null, percent: null, contextWindow: 500000 } });
-    await live.contextRefresh;
-    expect(formatContextUsage(readInfoFile(info.infoFile)?.contextUsage)).toBe("?%/500k");
-    expect(readInfoFile(info.infoFile)?.status).toBe("running");
-    expect(manager["mailbox"]).toHaveLength(0);
-  });
-
-  test.each([
-    { type: "compaction_end", result: { summary: "success" } },
-    { type: "entry_appended", entry: { type: "context_edit" } },
-    { type: "entry_appended", entry: { type: "compaction" } },
-  ])("invalidates known usage before a late pre-edit response %#", async (event) => {
-    refresh();
-    emit(event);
-    expect(live.contextEpoch).toBe(1);
-    expect(formatContextUsage(readInfoFile(info.infoFile)?.contextUsage)).toBe("?%/500k");
-    reply(commands[0], { contextUsage: { ...initialUsage, percent: 95 } });
-    await tick();
-    expect(commands).toHaveLength(2);
-    expect(formatContextUsage(readInfoFile(info.infoFile)?.contextUsage)).toBe("?%/500k");
-    reply(commands[1], undefined, false);
-    await live.contextRefresh;
-    expect(formatContextUsage(readInfoFile(info.infoFile)?.contextUsage)).toBe("?%/500k");
-    expect(readInfoFile(info.infoFile)?.lastActivity).toBe(1);
-  });
-
-  test("failed or canceled compaction does not invalidate or sample", () => {
-    emit({ type: "compaction_end", aborted: true });
-    emit({ type: "compaction_end", errorMessage: "failed" });
-    emit({ type: "compaction_start", reason: "threshold" });
-    expect(live.contextEpoch).toBe(0);
-    expect(commands).toHaveLength(0);
-    expect(readInfoFile(info.infoFile)?.contextUsage).toEqual(initialUsage);
-  });
-
-  test("all lifecycle gates stop both starting and saving background queries", async () => {
-    for (const flag of ["awaitingPrompt", "finalizedRun", "expectedExit", "processFinished"]) {
-      live[flag] = true;
-      const count = commands.length;
-      refresh();
-      expect(commands).toHaveLength(count);
-      live[flag] = false;
-      refresh();
-      live[flag] = true;
-      reply(commands.at(-1), { contextUsage: nextUsage });
-      await live.contextRefresh;
-      expect(readInfoFile(info.infoFile)?.contextUsage).toEqual(initialUsage);
-      live[flag] = false;
-    }
-    const owner = live.info.childProcess;
-    delete live.info.childProcess;
-    const count = commands.length;
-    refresh();
-    expect(commands).toHaveLength(count);
-    live.info.childProcess = owner;
-  });
-
-  test("late callbacks cannot recreate metadata, replace ownership or write from an old instance", async () => {
-    const original = fs.readFileSync(info.infoFile, "utf8");
-    for (const mode of ["deleted", "owner-cleared", "owner-replaced", "instance-replaced"]) {
-      fs.writeFileSync(info.infoFile, original);
-      refresh();
-      if (mode === "deleted") fs.rmSync(info.infoFile);
-      else if (mode === "instance-replaced") manager["live"].set(info.id, { ...live });
-      else {
-        const persisted = JSON.parse(original);
-        if (mode === "owner-cleared") delete persisted.childProcess;
-        else persisted.childProcess.token = "new-owner";
-        fs.writeFileSync(info.infoFile, JSON.stringify(persisted));
+    for (const dir of [TEST_AGENT_DIR, root, path.dirname(cwd), cwd]) {
+      for (const name of ["AGENTS.md", "AGENTS.override.md", "CLAUDE.md", "SYSTEM.md", "APPEND_SYSTEM.md"]) {
+        put(path.join(dir, name), "FORBIDDEN_AUTO_RESOURCE " + name);
       }
-      const before = fs.existsSync(info.infoFile) ? fs.readFileSync(info.infoFile, "utf8") : undefined;
-      reply(commands.at(-1), { contextUsage: nextUsage });
-      await live.contextRefresh;
-      expect(fs.existsSync(info.infoFile) ? fs.readFileSync(info.infoFile, "utf8") : undefined).toBe(before);
+    }
+    put(path.join(cwd, ".pi", "skills", "unselected", "SKILL.md"), "---\nname: unselected\ndescription: FORBIDDEN_AUTO_SKILL\n---\nDo not discover this.");
+    const skill = path.join(root, "explicit-skill", "SKILL.md");
+    put(skill, "---\nname: explicit-core-skill\ndescription: EXPLICIT_CORE_SKILL_DESCRIPTION\n---\nExplicit skill body.");
+    const template = path.join(TEST_AGENT_DIR, "pi-codex-subagents", "agents", "resource-policy.md");
+    put(template, "---\nname: resource-policy\nskills: explicit-core-skill\n---\nEXPLICIT_TEMPLATE_BODY");
+    const parentSession = codingAgent.SessionManager.create(cwd, root);
+    parentSession.appendMessage({ role: "user", content: "FORBIDDEN_PARENT_CONVERSATION", timestamp: Date.now() });
+    const manager = new AgentManager({ projectTrusted: () => true });
+    try {
+      await manager.spawnAgent({ ...spawnParams(parent, "worker", "assigned work"), cwd, agent_type: "resource-policy",
+        parentSessionFile: parentSession.getSessionFile()!, loadedSkillPaths: { "explicit-core-skill": path.dirname(skill) } });
+      const info = manager.getAgentInfo("worker", parent);
+      await released(manager, info);
+      expect(info.skillPaths).toEqual([path.dirname(skill)]);
+      expect(info.extensionPaths).toEqual([CORE_SDK_EXTENSION]);
+      expect(info.cwd).toBe(cwd);
+      expect(fixture.instances).toHaveLength(1); // Services must not evaluate the factory twice.
+      const request = fixture.instances[0].requests[0];
+      expect(request.text).toBe("EXPLICIT_TEMPLATE_BODY\n\nassigned work");
+      const input = JSON.stringify(request.context);
+      expect(input).toContain(literalTarget.replaceAll("\\", "\\\\"));
+      expect(input).toContain("EXPLICIT_CORE_SKILL_DESCRIPTION");
+      expect(input).not.toContain("FORBIDDEN_");
+      expect(input).not.toContain("Explicit skill body.");
+      fs.writeFileSync(ownSystem, "UPDATED_OWN_SYSTEM");
+      await manager.sendMessage(parent, "worker", "continuation");
+      await released(manager, info);
+      expect(JSON.stringify(fixture.instances[1].requests[0].context)).toContain("UPDATED_OWN_SYSTEM");
+      expect(fixture.instances[1].requests[0].text).toBe("continuation");
+      const nativeList = await codingAgent.SessionManager.list(cwd);
+      expect(nativeList.some((session) => session.path === info.sessionFile)).toBe(false);
+    } finally {
+      await manager.shutdown();
+      fs.rmSync(ownSystem, { force: true });
+      for (const file of files) fs.rmSync(file, { force: true });
+      fs.rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  test.each([undefined, "", "read"])("retains the tool-selection three-state contract (%s)", async (tools) => {
+    const parent = "tools-contract-" + randomUUID();
+    const name = "tool-contract-" + randomUUID();
+    const template = path.join(TEST_AGENT_DIR, "pi-codex-subagents", "agents", name + ".md");
+    fs.writeFileSync(template, "---\nname: " + name + (tools === undefined ? "" : "\ntools: " + tools) + "\n---\n");
+    const manager = new AgentManager();
+    try {
+      await manager.spawnAgent({ ...spawnParams(parent, "worker", "inspect tools"), agent_type: name });
+      const info = manager.getAgentInfo("worker", parent);
+      await released(manager, info);
+      const names = fixture.instances[0].requests[0].context.messages.flatMap((message: any) => message.toolsAdded ?? []).map((tool: any) => tool.name);
+      if (tools === "read") expect(names).toEqual(["read"]);
+      else if (tools === "") expect(names).toEqual(["fixture_hold"]);
+      else expect(names).toEqual(expect.arrayContaining(["read", "bash", "fixture_hold"]));
+      expect(info.tools).toBe(tools);
+    } finally { await manager.shutdown(); fs.rmSync(template, { force: true }); }
+  });
+});
+
+describe("SDK native context usage and failure cleanup", () => {
+  test("saves the final persisted usage rather than message_end's previous projection or cumulative billing", async () => {
+    fixture = configureCoreFixture({ tokens: (text) => text === "first" ? 50000 : 60000 });
+    const parent = "native-usage-" + randomUUID();
+    const manager = new AgentManager();
+    try {
+      await manager.spawnAgent(spawnParams(parent, "worker", "first"));
+      const info = manager.getAgentInfo("worker", parent);
+      await released(manager, info);
+      expect(manager.getAgentInfo("worker", parent).contextUsage).toEqual({ tokens: 50000, contextWindow: 500000, percent: 10 });
+      await manager.sendMessage(parent, "worker", "second");
+      await released(manager, info);
+      const final = manager.getAgentInfo("worker", parent);
+      expect(final.contextUsage).toEqual({ tokens: 60000, contextWindow: 500000, percent: 12 });
+      expect(sessionMessages(final).filter((entry) => entry.role === "assistant").reduce((sum, entry) => sum + entry.usage.totalTokens, 0)).toBe(110000);
+      expect(formatContextUsage(readInfoFile(final.infoFile)?.contextUsage)).toBe("12%/500k");
+      expect(fixture.instances.map((instance) => instance.shutdowns)).toEqual([1, 1]);
+    } finally { await manager.shutdown(); }
+  });
+
+  test("different children sample their own native model windows", async () => {
+    fixture = configureCoreFixture({ routes: [["test", "fake", 500000], ["test", "small", 200000]], tokens: 50000 });
+    const parent = "native-windows-" + randomUUID();
+    const manager = new AgentManager();
+    try {
+      await manager.spawnAgent(spawnParams(parent, "large", "first"));
+      await manager.spawnAgent({ ...spawnParams(parent, "small", "second"), model: { provider: "test", modelId: "small" } });
+      await Promise.all([released(manager, manager.getAgentInfo("large", parent)), released(manager, manager.getAgentInfo("small", parent))]);
+      expect(formatContextUsage(manager.getAgentInfo("large", parent).contextUsage)).toBe("10%/500k");
+      expect(formatContextUsage(manager.getAgentInfo("small", parent).contextUsage)).toBe("25%/200k");
+    } finally { await manager.shutdown(); }
+  });
+
+  test("native compaction invalidates old usage and a restored session can continue the same JSONL", async () => {
+    const parent = "compacted-" + randomUUID();
+    const manager = new AgentManager();
+    const gate = deferred();
+    try {
+      await manager.spawnAgent(spawnParams(parent, "worker", "first"));
+      const info = manager.getAgentInfo("worker", parent);
+      await released(manager, info);
+      const saved = codingAgent.SessionManager.open(info.sessionFile, path.dirname(info.sessionFile), info.cwd);
+      saved.appendCompaction("saved compacted summary", null, 60000);
+      fixture = configureCoreFixture({ responseGate: gate.promise });
+      await manager.sendMessage(parent, "worker", "hold after compaction");
+      const live = manager["live"].get(info.id)!;
+      const usage = live.session!.getContextUsage();
+      expect(usage).toEqual({ tokens: null, contextWindow: 500000, percent: null });
+      manager["sampleContextUsage"](live);
+      expect(manager.getAgentInfo("worker", parent).contextUsage).toEqual(usage);
+      gate.resolve();
+      await released(manager, info);
+      expect(formatContextUsage(manager.getAgentInfo("worker", parent).contextUsage)).toBe("12%/500k");
+      expect(fs.readFileSync(info.sessionFile, "utf8")).toContain("saved compacted summary");
+    } finally { gate.resolve(); await manager.shutdown(); }
+  });
+
+  test("a failed final context sample is visible but cannot prevent completion or disposal", async () => {
+    const gate = deferred();
+    fixture = configureCoreFixture({ responseGate: gate.promise });
+    const parent = "sampling-error-" + randomUUID();
+    const completions: any[] = [];
+    const errors: Error[] = [];
+    const manager = new AgentManager({ onError: (error) => errors.push(error), onUnclaimedCompletion: (event) => completions.push(event) });
+    try {
+      await manager.spawnAgent(spawnParams(parent, "worker", "hold sample"));
+      await waitUntil(() => fixture.instances[0].activeStreams === 1);
+      const info = manager.getAgentInfo("worker", parent);
+      const session = manager["live"].get(info.id)!.session!;
+      spyOn(session, "getContextUsage").mockImplementation(() => { throw new Error("native sample fixture failure"); });
+      gate.resolve();
+      await released(manager, info);
+      expect(manager.readAgentResponse("worker", parent).status).toBe("completed");
+      expect(completions).toHaveLength(1);
+      expect(errors.some((error) => error.message.includes("native sample fixture failure"))).toBe(true);
+      expect(fixture.instances[0].shutdowns).toBe(1);
+    } finally { gate.resolve(); await manager.shutdown(); }
+  });
+
+  test("sampling is synchronous, validates data, retries an identical failed save, and ignores replaced live objects", async () => {
+    const parent = "usage-persistence-" + randomUUID();
+    const errors: Error[] = [];
+    const manager = new AgentManager({ onError: (error) => errors.push(error) });
+    try {
+      await manager.spawnAgent(spawnParams(parent, "worker", "hold usage"));
+      const info = manager.getAgentInfo("worker", parent);
+      const live = manager["live"].get(info.id)!;
+      const usage = { tokens: 60000, contextWindow: 500000, percent: 12 };
+      const sample = spyOn(live.session!, "getContextUsage").mockReturnValue(usage);
+      const before = manager.getAgentInfo("worker", parent);
+      const rename = fs.renameSync;
+      const failSave = spyOn(fs, "renameSync").mockImplementation((from, to) => {
+        if (String(to) === info.infoFile) throw new Error("usage write fixture failure");
+        return rename(from, to);
+      });
+      manager["sampleContextUsage"](live);
+      expect(live.info.contextUsage).toBeUndefined();
+      expect(manager.getAgentInfo("worker", parent).contextUsage).toBeUndefined();
+      failSave.mockRestore();
+      manager["sampleContextUsage"](live);
+      expect(manager.getAgentInfo("worker", parent)).toMatchObject({ contextUsage: usage, status: before.status, messageCount: before.messageCount, lastActivity: before.lastActivity });
+      const writes = spyOn(fs, "renameSync");
+      manager["sampleContextUsage"](live);
+      expect(writes).not.toHaveBeenCalled();
+      writes.mockRestore();
+      sample.mockReturnValue({ tokens: 1, contextWindow: 0, percent: 1 });
+      manager["sampleContextUsage"](live);
+      expect(manager.getAgentInfo("worker", parent).contextUsage).toBeUndefined();
+      sample.mockReturnValue(usage);
+      manager["live"].delete(info.id);
+      manager["sampleContextUsage"](live);
+      expect(manager.getAgentInfo("worker", parent).contextUsage).toBeUndefined();
       manager["live"].set(info.id, live);
-    }
+      expect(errors.some((error) => error.message.includes("usage write fixture failure"))).toBe(true);
+    } finally { await manager.shutdown(); }
   });
 
-  test("merges with current persisted lifecycle but never copies it back into live state", async () => {
-    refresh();
-    const persisted = { ...info, status: "completed", finalResponse: "preserve", completedAt: 123, lastActivity: 123 };
-    fs.writeFileSync(info.infoFile, JSON.stringify(persisted));
-    reply(commands[0], { contextUsage: nextUsage });
-    await live.contextRefresh;
-    expect(readInfoFile(info.infoFile)).toMatchObject({
-      status: "completed", finalResponse: "preserve", completedAt: 123, lastActivity: 123,
-      childProcess: persisted.childProcess, contextUsage: nextUsage,
-    });
-    expect(live.info.status).toBe("running");
-    expect(live.info.lastActivity).toBe(1);
-    emit({ type: "turn_end" });
-    expect(live.finalizedRun).toBe(true);
-    expect(commands).toHaveLength(1);
+  test("one failed shutdown save still cleans every child and reports the original persistence error", async () => {
+    const parent = "shutdown-save-" + randomUUID();
+    const errors: Error[] = [];
+    const manager = new AgentManager({ onError: (error) => errors.push(error) });
+    let save: ReturnType<typeof spyOn> | undefined;
+    try {
+      await manager.spawnAgent(spawnParams(parent, "one", "hold first"));
+      await manager.spawnAgent(spawnParams(parent, "two", "hold second"));
+      await waitUntil(() => fixture.instances.every((instance) => instance.activeStreams === 1));
+      const one = manager.getAgentInfo("one", parent);
+      const rename = fs.renameSync;
+      save = spyOn(fs, "renameSync").mockImplementation((from, to) => {
+        if (String(to) === one.infoFile) throw new Error("shutdown save fixture failure");
+        return rename(from, to);
+      });
+      await expect(manager.shutdown()).rejects.toThrow("shutdown save fixture failure");
+      expect(manager["live"].size).toBe(0);
+      expect(fixture.instances.map((instance) => instance.shutdowns)).toEqual([1, 1]);
+      expect(fixture.instances.every((instance) => instance.activeStreams === 0)).toBe(true);
+      expect(errors.some((error) => error.message.includes("shutdown save fixture failure"))).toBe(true);
+    } finally { save?.mockRestore(); await manager.shutdown(); }
+  });
+});
+
+describe("SDK acceptance and observer edge cases", () => {
+  test.each(["completed", "failed", "interrupted"] as const)("a submitted but unaccepted prompt rejection restores the previous %s snapshot", async (status) => {
+    const parent = "unaccepted-" + randomUUID();
+    const completions: any[] = [];
+    const manager = new AgentManager({ onUnclaimedCompletion: (event) => completions.push(event) });
+    let prompt: ReturnType<typeof spyOn> | undefined;
+    try {
+      await manager.spawnAgent(spawnParams(parent, "worker", status === "completed" ? "first" : status === "failed" ? "fail first" : "hold first"));
+      if (status === "interrupted") await manager.interruptAgent(parent, "worker");
+      const original = manager.getAgentInfo("worker", parent);
+      await released(manager, original);
+      const before = manager.getAgentInfo("worker", parent);
+      const count = completions.length;
+      // A small method spy covers native preflight rejection without a backend injection API.
+      prompt = spyOn(codingAgent.AgentSession.prototype, "prompt").mockRejectedValueOnce(new Error("unaccepted prompt fixture rejection"));
+      await expect(manager.sendMessage(parent, "worker", "not accepted")).rejects.toThrow("unaccepted prompt fixture rejection");
+      await released(manager, before);
+      const after = manager.getAgentInfo("worker", parent);
+      expect(after).toMatchObject({ status, messageCount: before.messageCount, completedAt: before.completedAt, lastTaskMessage: before.lastTaskMessage });
+      expect(after.finalResponse).toBe(before.finalResponse);
+      expect(after.error).toBe(before.error);
+      expect(completions).toHaveLength(count);
+      expect(fixture.instances[1].requests).toEqual([]);
+      expect(fixture.instances[1].shutdowns).toBe(1);
+    } finally { prompt?.mockRestore(); await manager.shutdown(); }
   });
 
-  test("retries an identical sample after an atomic write failure without advancing memory", async () => {
-    const temporary = `${info.infoFile}.${process.pid}.tmp`;
-    fs.mkdirSync(temporary);
-    live.logger.info = mock(() => { throw new Error("log storage also unavailable"); });
-    refresh();
-    reply(commands[0], { contextUsage: nextUsage });
-    await live.contextRefresh;
-    expect(readInfoFile(info.infoFile)?.contextUsage).toEqual(initialUsage);
-    expect(live.info.contextUsage).toEqual(initialUsage);
-    expect(live.logger.info).toHaveBeenCalledTimes(1);
-    fs.rmSync(temporary, { recursive: true });
-    emit({ type: "turn_end" });
-    reply(commands[1], { contextUsage: nextUsage });
-    await live.contextRefresh;
-    expect(readInfoFile(info.infoFile)?.contextUsage).toEqual(nextUsage);
+  test("a delayed unaccepted rejection cannot restore a completed snapshot over explicit interrupt", async () => {
+    const gate = deferred();
+    const parent = "reject-after-interrupt-" + randomUUID();
+    const manager = new AgentManager();
+    let prompt: ReturnType<typeof spyOn> | undefined;
+    let pending: Promise<unknown> | undefined;
+    try {
+      await manager.spawnAgent(spawnParams(parent, "worker", "first"));
+      const info = manager.getAgentInfo("worker", parent);
+      await released(manager, info);
+      prompt = spyOn(codingAgent.AgentSession.prototype, "prompt").mockImplementationOnce(async () => {
+        await gate.promise;
+        throw new Error("late unaccepted fixture rejection");
+      });
+      pending = manager.sendMessage(parent, "worker", "not accepted").then(() => undefined, (error) => error);
+      await waitUntil(() => Boolean(manager["live"].get(info.id)?.promptFinished));
+      const interruption = manager.interruptAgent(parent, "worker");
+      await waitUntil(() => manager.getAgentInfo("worker", parent).status === "interrupted");
+      gate.resolve();
+      await interruption;
+      expect(await pending).toBeInstanceOf(Error);
+      await released(manager, info);
+      expect(manager.readAgentResponse("worker", parent)).toMatchObject({ status: "interrupted" });
+      expect(manager.getAgentInfo("worker", parent).finalResponse).toBeUndefined();
+      expect((await manager.waitAgent(parent, ["worker"])).event?.status).toBe("interrupted");
+    } finally { gate.resolve(); await pending; prompt?.mockRestore(); await manager.shutdown(); }
   });
 
-  test("online steer saves the canonical live object after sampling during its await", async () => {
-    const delivery = manager.sendMessage(info.parentSessionId, "worker", "new direction");
-    await tick();
-    expect(commands[0].type).toBe("steer");
-    emit({ type: "turn_end" });
-    reply(commands[1], { contextUsage: nextUsage });
-    await live.contextRefresh;
-    reply(commands[0], {});
-    expect(await delivery).toEqual({ delivery: "steer" });
-    expect(readInfoFile(info.infoFile)).toMatchObject({
-      contextUsage: nextUsage, status: "running", childProcess: info.childProcess, lastTaskMessage: "new direction",
-    });
+  test("a rejection after acceptance fails this run rather than restoring the previous answer", async () => {
+    const gate = deferred();
+    const parent = "accepted-rejection-" + randomUUID();
+    const completions: any[] = [];
+    const manager = new AgentManager({ onUnclaimedCompletion: (event) => completions.push(event) });
+    let prompt: ReturnType<typeof spyOn> | undefined;
+    try {
+      await manager.spawnAgent(spawnParams(parent, "worker", "first"));
+      const info = manager.getAgentInfo("worker", parent);
+      await released(manager, info);
+      prompt = spyOn(codingAgent.AgentSession.prototype, "prompt").mockImplementationOnce(async (_text, options) => {
+        options?.preflightResult?.("started");
+        await gate.promise;
+        throw new Error("accepted run fixture failure");
+      });
+      expect(await manager.sendMessage(parent, "worker", "accepted new task")).toEqual({ delivery: "prompt" });
+      gate.resolve();
+      await released(manager, info);
+      expect(manager.getAgentInfo("worker", parent)).toMatchObject({ status: "failed", messageCount: 2, error: "accepted run fixture failure" });
+      expect(manager.getAgentInfo("worker", parent).finalResponse).toBeUndefined();
+      expect(completions).toHaveLength(2);
+      expect(fixture.instances[1].shutdowns).toBe(1);
+    } finally { gate.resolve(); prompt?.mockRestore(); await manager.shutdown(); }
   });
 
-  test("online controls keep their original persisted-status decisions when another manager has interrupted the run", async () => {
-    fs.writeFileSync(info.infoFile, JSON.stringify({ ...info, status: "interrupted" }));
-    expect(await manager.interruptAgent(info.parentSessionId, "worker")).toEqual({ previous_status: "interrupted" });
-    expect(commands).toHaveLength(0);
-    expect(manager["mailbox"]).toHaveLength(0);
-    const delivery = manager.sendMessage(info.parentSessionId, "worker", "resume");
-    await tick();
-    expect(commands.map((command) => command.type)).toEqual(["prompt"]);
-    reply(commands[0], {});
-    expect(await delivery).toEqual({ delivery: "prompt" });
-    expect(commands[1].type).toBe("get_session_stats");
-    reply(commands[1], { contextUsage: nextUsage });
-    await live.contextRefresh;
-    expect(readInfoFile(info.infoFile)).toMatchObject({ status: "running", contextUsage: nextUsage });
+  test("settled.aborted without an assistant is a failed run, not the previous response", async () => {
+    const parent = "settled-without-assistant-" + randomUUID();
+    const manager = new AgentManager();
+    let prompt: ReturnType<typeof spyOn> | undefined;
+    try {
+      await manager.spawnAgent(spawnParams(parent, "worker", "first"));
+      const info = manager.getAgentInfo("worker", parent);
+      await released(manager, info);
+      prompt = spyOn(codingAgent.AgentSession.prototype, "prompt").mockImplementationOnce(async (_text, options) => {
+        options?.preflightResult?.("handled");
+        await Promise.resolve(); // Let the caller install its original prompt Promise first.
+        manager["handleSessionEvent"](manager["live"].get(info.id)!, { type: "agent_settled", aborted: true } as any);
+      });
+      await manager.sendMessage(parent, "worker", "handled aborted");
+      await released(manager, info);
+      expect(manager.getAgentInfo("worker", parent)).toMatchObject({ status: "failed", error: "Agent ended with aborted." });
+      expect(manager.getAgentInfo("worker", parent).finalResponse).toBeUndefined();
+      expect(fixture.instances[1].requests).toEqual([]);
+    } finally { prompt?.mockRestore(); await manager.shutdown(); }
   });
 
-  test("settlement delivers completion before final sampling, and old background results cannot overwrite it", async () => {
-    refresh();
-    emit({ type: "message_end", message: { role: "assistant", content: [{ type: "text", text: "done" }] } });
-    emit({ type: "agent_settled" });
-    expect(commands.map((command) => command.type)).toEqual(["get_session_stats", "abort", "get_session_stats"]);
-    expect(live.expectedExit).toBe(true);
-    expect(live.termination).toBeInstanceOf(Promise);
-    expect(readInfoFile(info.infoFile)).toMatchObject({ status: "completed", finalResponse: "done" });
-    expect((await manager.waitAgent(info.parentSessionId, ["worker"])).event?.finalResponse).toBe("done");
-    // Both management responses are decoded from a single data block.
-    const decoder = new RpcJsonlDecoder();
-    const records = [
-      { type: "response", id: commands[2].id, success: true, data: { contextUsage: nextUsage } },
-      { type: "response", id: commands[0].id, success: true, data: { contextUsage: initialUsage } },
-      { type: "response", id: commands[1].id, success: true, data: {} },
-    ];
-    for (const line of decoder.push(Buffer.from(records.map((record) => JSON.stringify(record) + "\n").join("")))) {
-      manager["handleLine"](live, line);
-    }
-    await live.termination;
-    await live.contextRefresh;
-    expect(readInfoFile(info.infoFile)).toMatchObject({ status: "completed", finalResponse: "done", contextUsage: nextUsage });
-    expect(live.contextRefreshDirty).toBe(false);
-  });
-
-  test("final sampling keeps its original token even if a late event adopts another owner's final record", async () => {
-    emit({ type: "agent_settled" });
-    const replacement = {
-      ...readInfoFile(info.infoFile)!, status: "failed", error: "replacement run",
-      contextUsage: nextUsage, childProcess: { ...info.childProcess!, token: "replacement-token" },
-    };
-    fs.writeFileSync(info.infoFile, JSON.stringify(replacement));
-    emit({ type: "turn_end" });
-    expect(live.info.childProcess?.token).toBe("replacement-token");
-    const before = fs.readFileSync(info.infoFile, "utf8");
-    reply(commands[1], { contextUsage: { ...initialUsage, percent: 90 } });
-    reply(commands[0], {});
-    await live.termination;
-    expect(fs.readFileSync(info.infoFile, "utf8")).toBe(before);
-  });
-
-  test("a timed-out final query retains the snapshot and continues termination", async () => {
-    emit({ type: "agent_settled" });
-    expect(manager["mailbox"]).toHaveLength(1);
-    reply(commands[0], {});
-    await live.termination;
-    expect(live.processFinished).toBe(true);
-    expect(live.pending.size).toBe(0);
-    expect(readInfoFile(info.infoFile)?.contextUsage).toEqual(initialUsage);
-    expect(manager["mailbox"]).toHaveLength(1);
-  });
-
-  test("a failed final sample cannot prevent SIGTERM/forced-kill escalation", async () => {
-    const escalation: string[] = [];
-    live.proc.stdin.end = mock(() => {});
-    manager["signalProcessTree"] = (_live, signal) => {
-      escalation.push(signal);
-      if (signal === "SIGKILL") {
-        live.processFinished = true;
-        live.exitPromise = Promise.resolve();
+  test("nested native tool activity is retained by the manager but filtered only from observer state", async () => {
+    const gate = deferred();
+    fixture = configureCoreFixture({ responseGate: gate.promise });
+    const parent = "nested-native-" + randomUUID();
+    const completions: any[] = [];
+    const manager = new AgentManager({ onUnclaimedCompletion: (event) => completions.push(event) });
+    try {
+      await manager.spawnAgent(spawnParams(parent, "worker", "hold nested"));
+      await waitUntil(() => fixture.instances[0].activeStreams === 1);
+      const info = manager.getAgentInfo("worker", parent);
+      const live = manager["live"].get(info.id)!;
+      for (const event of [
+        { type: "tool_execution_start", args: {} },
+        { type: "tool_execution_update", partialResult: { content: [{ type: "text", text: "nested progress" }] } },
+        { type: "tool_execution_end", result: { content: [{ type: "text", text: "nested error" }] }, isError: true },
+      ]) {
+        live.lastActivityPersistedAt = 0;
+        manager["handleSessionEvent"](live, { ...event, toolCallId: "parent/child", toolName: "read", parentToolCallId: "parent" } as any);
+        expect(manager.getAgentInfo("worker", parent).lastActivity).toBe(live.info.lastActivity);
+        expect(live.lastActivityPersistedAt).toBeGreaterThan(0);
       }
-    };
-    manager["forceKillWindowsTree"] = async () => {
-      escalation.push("windows-kill");
-      live.processFinished = true;
-      live.exitPromise = Promise.resolve();
-    };
-    emit({ type: "agent_settled" });
-    reply(commands[0], {});
-    reply(commands[1], {}, false);
-    await live.termination;
-    expect(escalation).toEqual(["SIGTERM", process.platform === "win32" ? "windows-kill" : "SIGKILL"]);
-    expect(live.proc.stdin.end).toHaveBeenCalledTimes(1);
-    expect(readInfoFile(info.infoFile)).toMatchObject({ status: "completed", contextUsage: initialUsage });
-    expect(manager["mailbox"]).toHaveLength(1);
+      const [sync] = await readSocketEvents(getSocketPath(info.id), 1);
+      expect(sync.activeTools).toEqual([]);
+      expect(completions).toEqual([]);
+      gate.resolve();
+      await released(manager, info);
+      expect(completions).toEqual([expect.objectContaining({ status: "completed", finalResponse: "response:hold nested" })]);
+      expect(manager.readAgentResponse("worker", parent).finalResponse).toBe("response:hold nested");
+      expect((await manager.waitAllAgents(parent, ["worker"])).responses).toEqual([expect.objectContaining({ status: "completed" })]);
+    } finally { gate.resolve(); await manager.shutdown(); }
   });
 
-  test.each(["interrupt", "shutdown"])("forced %s does not request final statistics", async (action) => {
-    const ending = action === "interrupt" ? manager.interruptAgent(info.parentSessionId, "worker") : manager.shutdown();
-    await tick();
-    expect(commands.map((command) => command.type)).toEqual(["abort"]);
-    expect(readInfoFile(info.infoFile)).toMatchObject({ status: "interrupted", contextUsage: initialUsage });
-    reply(commands[0], {});
-    await ending;
+  test("an uncooperative manager shutdown is bounded, refuses new work, and finishes late cleanup", async () => {
+    const gate = deferred();
+    fixture = configureCoreFixture({ responseGate: gate.promise, ignoreAbort: true });
+    const parent = "uncooperative-shutdown-" + randomUUID();
+    const errors: Error[] = [];
+    const manager = new AgentManager({ onError: (error) => errors.push(error) });
+    try {
+      await manager.spawnAgent(spawnParams(parent, "worker", "hold shutdown"));
+      await waitUntil(() => fixture.instances[0].activeStreams === 1);
+      const info = manager.getAgentInfo("worker", parent);
+      const started = Date.now();
+      await expect(manager.shutdown()).rejects.toThrow(/closing/);
+      expect(Date.now() - started).toBeLessThan(4000);
+      expect(manager["live"].has(info.id)).toBe(true);
+      expect(fs.existsSync(activeMarker(info.id))).toBe(true);
+      await expect(manager.spawnAgent(spawnParams(parent, "late", "must not run"))).rejects.toThrow(/shut/);
+      await expect(manager.sendMessage(parent, "worker", "must not run")).rejects.toThrow(/shut/);
+      gate.resolve();
+      await released(manager, info);
+      expect(fixture.instances[0].shutdowns).toBe(1);
+      expect(fixture.instances[0].activeStreams).toBe(0);
+      expect(errors.length).toBeGreaterThan(0);
+    } finally { gate.resolve(); await manager.shutdown(); }
   });
 
-  test("prompt rejection preserves the previous final snapshot and never triggers acceptance sampling", async () => {
-    live.info.status = "completed";
-    live.info.finalResponse = "previous";
-    live.info.completedAt = 99;
-    const rejected = manager["prompt"](live, "reject", "reject").then(() => undefined, (error) => error);
-    expect(commands.map((command) => command.type)).toEqual(["prompt"]);
-    reply(commands[0], {}, false);
-    expect(await rejected).toBeInstanceOf(Error);
-    expect(readInfoFile(info.infoFile)).toMatchObject({ status: "completed", finalResponse: "previous", contextUsage: initialUsage });
-    expect(commands).toHaveLength(1);
-  });
-});
-
-describe("context usage RPC integration", () => {
-  let manager: InstanceType<typeof AgentManager>;
-  let parentSessionId: string;
-  const usage = (percent: number, contextWindow = 500000) => ({
-    tokens: percent * contextWindow / 100, contextWindow, percent,
-  });
-  const configure = (responses: any) => { process.env.PI_SUBAGENT_TEST_MODEL_RESPONSES = JSON.stringify(responses); };
-  const records = (info: AgentInfo) => fs.readFileSync(info.sessionFile, "utf8").trim().split("\n").map((line) => JSON.parse(line));
-  const countStats = (info: AgentInfo) => records(info).filter((record) => record.type === "get_session_stats").length;
-
-  beforeEach(async () => {
-    process.env.PI_SUBAGENT_PI_BIN = FAKE_RPC_CHILD;
-    parentSessionId = `context-rpc-${randomUUID()}`;
-    manager = new AgentManager();
-    await manager.ready();
-  });
-
-  afterEach(async () => {
-    await manager.shutdown();
-    fs.rmSync(path.join(getRunsDir(), parentScopeKey(parentSessionId)), { recursive: true, force: true });
-    delete process.env.PI_SUBAGENT_PI_BIN;
-    delete process.env.PI_SUBAGENT_TEST_MODEL_RESPONSES;
-  });
-
-  test("saves a final native snapshot, resumes the same session without resetting it, and interrupts without extra sampling", async () => {
-    configure({ contextResponses: [
-      { data: { tokens: { total: 110000 }, contextUsage: usage(12) } },
-      { data: { contextUsage: usage(14) } },
-    ] });
-    await manager.spawnAgent(spawnParams(parentSessionId, "worker", "first"));
-    const first = manager.getAgentInfo("worker", parentSessionId);
-    expect((await manager.waitAgent(parentSessionId, ["worker"])).event?.finalResponse).toBe("response:first");
-    await waitUntil(() => !manager.getAgentInfo("worker", parentSessionId).childProcess);
-    expect(formatContextUsage(manager.getAgentInfo("worker", parentSessionId).contextUsage)).toBe("14%/500k");
-    expect(countStats(first)).toBeGreaterThanOrEqual(2);
-
-    configure({ contextResponses: [{ hold: true }] });
-    expect(await manager.sendMessage(parentSessionId, "worker", "hold resumed")).toEqual({ delivery: "prompt" });
-    const resumed = manager.getAgentInfo("worker", parentSessionId);
-    const live = manager["live"].get(first.id)!;
-    expect(resumed.id).toBe(first.id);
-    expect(resumed.sessionFile).toBe(first.sessionFile);
-    expect(resumed.contextUsage).toEqual(usage(14));
-    expect(resumed.childProcess?.pid).not.toBe(first.childProcess?.pid);
-    await waitUntil(() => records(resumed).filter((record) => record.pid === resumed.childProcess?.pid && record.type === "get_session_stats").length === 1);
-    const before = countStats(resumed);
-    await manager.interruptAgent(parentSessionId, "worker");
-    await live.contextRefresh;
-    expect(countStats(resumed)).toBe(before);
-    expect(live.pending.size).toBe(0);
-    expect(live.contextRefresh).toBeUndefined();
-    expect(manager.getAgentInfo("worker", parentSessionId)).toMatchObject({ status: "interrupted", contextUsage: usage(14) });
-    expect(records(resumed).filter((record) => record.type === "prompt").map((record) => record.message)).toEqual(["first", "hold resumed"]);
-  });
-
-  test("settled continuation waits for a timed-out final query instead of steering the exiting process", async () => {
-    configure({ contextResponses: [{ data: { contextUsage: usage(10) } }, { hold: true }] });
-    await manager.spawnAgent(spawnParams(parentSessionId, "worker", "first"));
-    const first = manager.getAgentInfo("worker", parentSessionId);
-    const oldLive = manager["live"].get(first.id)!;
-    const completed = await manager.waitAgent(parentSessionId, ["worker"]);
-    expect(completed.event?.status).toBe("completed");
-    expect(oldLive.expectedExit).toBe(true);
-    expect(oldLive.processFinished).toBe(false);
-    expect(manager.getAgentInfo("worker", parentSessionId).contextUsage).toEqual(usage(10));
-    expect(await manager.sendMessage(parentSessionId, "worker", "hold continuation")).toEqual({ delivery: "prompt" });
-    expect(oldLive.processFinished).toBe(true);
-    await oldLive.contextRefresh;
-    expect(oldLive.pending.size).toBe(0);
-    const resumed = manager.getAgentInfo("worker", parentSessionId);
-    expect(resumed.childProcess?.pid).not.toBe(first.childProcess?.pid);
-    const sessionRecords = records(resumed);
-    expect(sessionRecords.filter((record) => record.type === "started")).toHaveLength(2);
-    expect(sessionRecords.filter((record) => record.type === "steer")).toHaveLength(0);
-    expect(sessionRecords.filter((record) => record.type === "prompt").map((record) => record.message)).toEqual(["first", "hold continuation"]);
-    expect(resumed.contextUsage).toEqual(usage(10));
-  });
-
-  test("steer and event sampling interleave without losing a newer snapshot or process ownership", async () => {
-    configure({
-      contextResponses: [{ data: { contextUsage: usage(10) } }, { data: { contextUsage: usage(12) } }],
-      steerDelayMs: 150,
-      steerEvents: [{ event: { type: "message_end", message: { role: "user", content: "steered" } } }],
-    });
-    await manager.spawnAgent(spawnParams(parentSessionId, "worker", "hold steer"));
-    await waitUntil(() => manager.getAgentInfo("worker", parentSessionId).contextUsage?.percent === 10);
-    const started = manager.getAgentInfo("worker", parentSessionId);
-    const delivery = manager.sendMessage(parentSessionId, "worker", "new direction");
-    await waitUntil(() => manager.getAgentInfo("worker", parentSessionId).contextUsage?.percent === 12);
-    expect(await delivery).toEqual({ delivery: "steer" });
-    expect(manager.getAgentInfo("worker", parentSessionId)).toMatchObject({
-      status: "running", contextUsage: usage(12), childProcess: started.childProcess, lastTaskMessage: "new direction",
-    });
-  });
-
-  test("a successful compaction in the old response's stdout chunk invalidates it even if the next query fails", async () => {
-    configure({
-      contextResponses: [
-        { data: { contextUsage: usage(10) } },
-        { data: { contextUsage: usage(95) }, events: [{ type: "compaction_end", result: { summary: "compacted" } }] },
-        { success: false },
-      ],
-      steerEvents: [{ event: { type: "turn_end" } }],
-    });
-    await manager.spawnAgent(spawnParams(parentSessionId, "worker", "hold compaction"));
-    await waitUntil(() => manager.getAgentInfo("worker", parentSessionId).contextUsage?.percent === 10);
-    await manager.sendMessage(parentSessionId, "worker", "compact now");
-    const info = manager.getAgentInfo("worker", parentSessionId);
-    const live = manager["live"].get(info.id)!;
-    await waitUntil(() => live.contextEpoch === 1 && countStats(info) === 3 && !live.contextRefresh);
-    expect(formatContextUsage(manager.getAgentInfo("worker", parentSessionId).contextUsage)).toBe("?%/500k");
-    await new Promise((resolve) => setTimeout(resolve, 30));
-    expect(countStats(info)).toBe(3);
-    expect(manager.getAgentInfo("worker", parentSessionId).status).toBe("running");
-  });
-
-  test("different children use their own native windows rather than a parent model window", async () => {
-    configure({ contextResponses: [{ data: { contextUsage: usage(10, 500000) } }] });
-    await manager.spawnAgent(spawnParams(parentSessionId, "small", "hold small"));
-    configure({ contextResponses: [{ data: { contextUsage: usage(20, 1050000) } }] });
-    await manager.spawnAgent({ ...spawnParams(parentSessionId, "large", "hold large"), inheritedModelId: "template-model" });
-    await waitUntil(() => Boolean(manager.getAgentInfo("small", parentSessionId).contextUsage && manager.getAgentInfo("large", parentSessionId).contextUsage));
-    expect(formatContextUsage(manager.getAgentInfo("small", parentSessionId).contextUsage)).toBe("10%/500k");
-    expect(formatContextUsage(manager.getAgentInfo("large", parentSessionId).contextUsage)).toBe("20%/1.05M");
-  });
-
-  test("old final responses and process-exit cleanup cannot mutate a replacement owner's record", async () => {
-    configure({ contextResponses: [
-      { data: { contextUsage: usage(10) } },
-      { data: { contextUsage: usage(12) }, delayMs: 150 },
-    ] });
-    await manager.spawnAgent(spawnParams(parentSessionId, "worker", "slow first"));
-    const initial = manager.getAgentInfo("worker", parentSessionId);
-    const live = manager["live"].get(initial.id)!;
-    await manager.waitAgent(parentSessionId, ["worker"]);
-    const replacement = {
-      ...manager.getAgentInfo("worker", parentSessionId), status: "failed", error: "replacement run",
-      contextUsage: usage(67), childProcess: { ...initial.childProcess!, token: "replacement-token" },
-    };
-    fs.writeFileSync(initial.infoFile, JSON.stringify(replacement));
-    manager["handleLine"](live, JSON.stringify({ type: "turn_end" }));
-    expect(live.info.childProcess?.token).toBe("replacement-token");
-    const before = fs.readFileSync(initial.infoFile, "utf8");
-    await live.termination;
-    await live.contextRefresh;
-    expect(live.processFinished).toBe(true);
-    expect(fs.readFileSync(initial.infoFile, "utf8")).toBe(before);
-    expect(manager.getAgentInfo("worker", parentSessionId).childProcess?.token).toBe("replacement-token");
-  });
-
-  test("unexpected exit rejects pending statistics without reviving ownership or changing failure delivery", async () => {
-    configure({ contextResponses: [{ hold: true }] });
-    await manager.spawnAgent(spawnParams(parentSessionId, "worker", "crash now"));
-    const info = manager.getAgentInfo("worker", parentSessionId);
-    const live = manager["live"].get(info.id)!;
-    expect((await manager.waitAgent(parentSessionId, ["worker"])).event?.status).toBe("failed");
-    await waitUntil(() => !manager.getAgentInfo("worker", parentSessionId).childProcess);
-    await live.contextRefresh;
-    expect(live.pending.size).toBe(0);
-    expect(live.contextRefresh).toBeUndefined();
-    const failed = manager.getAgentInfo("worker", parentSessionId);
-    expect(failed.status).toBe("failed");
-    expect(failed.contextUsage).toBeUndefined();
-    expect(failed.childProcess).toBeUndefined();
-    expect(countStats(info)).toBe(1);
+  test("an uncooperative extension shutdown still disposes once after its own finite deadline", async () => {
+    const gate = deferred();
+    fixture = configureCoreFixture({ shutdownGate: gate.promise });
+    const original = globalThis.setTimeout;
+    const timers = spyOn(globalThis, "setTimeout").mockImplementation(((callback: any, delay: number, ...args: any[]) =>
+      original(callback, delay === 5000 ? 100 : delay, ...args)) as typeof setTimeout);
+    const parent = "shutdown-hook-timeout-" + randomUUID();
+    const errors: Error[] = [];
+    const manager = new AgentManager({ onError: (error) => errors.push(error) });
+    try {
+      await manager.spawnAgent(spawnParams(parent, "worker", "first"));
+      const info = manager.getAgentInfo("worker", parent);
+      const live = manager["live"].get(info.id)!;
+      const dispose = spyOn(live.session!, "dispose");
+      await released(manager, info);
+      expect(dispose).toHaveBeenCalledTimes(1);
+      expect(fixture.instances[0].shutdowns).toBe(1);
+      expect(errors.some((error) => error.message.includes("session_shutdown timed out"))).toBe(true);
+      expect(manager.readAgentResponse("worker", parent).status).toBe("completed");
+      expect(fs.existsSync(activeMarker(info.id))).toBe(false);
+    } finally { timers.mockRestore(); gate.resolve(); await manager.shutdown(); }
   });
 });
 
-test("real Pi RPC reports current context rather than billing totals and clears pre-compaction usage", async () => {
-  const directory = fs.mkdtempSync(path.join(TEST_AGENT_DIR, "native-context-rpc-"));
-  const provider = "context-test";
-  const model = "context-fixture";
-  const api = "openai-completions";
-  fs.writeFileSync(path.join(directory, "models.json"), JSON.stringify({
-    providers: { [provider]: {
-      api, apiKey: "offline-fixture", baseUrl: "http://127.0.0.1:9/v1",
-      models: [{ id: model, contextWindow: 500000, maxTokens: 1024, input: ["text"], reasoning: false }],
-    } },
-  }));
-  const makeSession = (count: number, compacted = false, afterCompaction = false) => {
-    const session = codingAgent.SessionManager.create(directory, directory);
-    session.appendModelChange(provider, model);
-    session.appendMessage({ role: "user", content: "saved context", timestamp: 1 });
-    const appendAssistant = (tokens: number) => session.appendMessage({
-      role: "assistant", content: [{ type: "text", text: "saved response" }],
-      api, provider, model, stopReason: "stop", timestamp: 2,
-      usage: { input: tokens, output: 0, cacheRead: 0, cacheWrite: 0, totalTokens: tokens,
-        cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 } },
-    });
-    appendAssistant(50000);
-    if (count > 1) appendAssistant(60000);
-    if (compacted) session.appendCompaction("saved summary", null, 60000);
-    if (afterCompaction) appendAssistant(40000);
-    return session.getSessionFile()!;
-  };
-  const sessions = [makeSession(1), makeSession(2), makeSession(2, true), makeSession(2, true, true)];
-  const client = new codingAgent.RpcClient({
-    cliPath: path.join(path.dirname(Bun.resolveSync("@earendil-works/pi-coding-agent", import.meta.dir)), "cli.js"),
-    cwd: directory, provider, model,
-    env: { PI_CODING_AGENT_DIR: directory, PI_OFFLINE: "1", PI_SKIP_VERSION_CHECK: "1", PI_TELEMETRY: "0" },
-    args: ["--no-extensions", "--no-skills", "--no-prompt-templates", "--no-context-files", "--no-builtin-tools", "--session", sessions[0]],
-  });
-  try {
-    await client.start();
-    expect((await client.getState()).model).toMatchObject({ provider, id: model });
-    const first = await client.getSessionStats();
-    expect(first.contextUsage).toEqual({ tokens: 50000, contextWindow: 500000, percent: 10 });
-    expect(formatContextUsage(first.contextUsage)).toBe("10%/500k");
-    await client.switchSession(sessions[1]);
-    const second = await client.getSessionStats();
-    expect(second.tokens.total).toBe(110000);
-    expect(second.contextUsage).toEqual({ tokens: 60000, contextWindow: 500000, percent: 12 });
-    expect(formatContextUsage(second.contextUsage)).toBe("12%/500k");
-    await client.switchSession(sessions[2]);
-    const compacted = await client.getSessionStats();
-    expect(compacted.contextUsage).toEqual({ tokens: null, contextWindow: 500000, percent: null });
-    expect(formatContextUsage(compacted.contextUsage)).toBe("?%/500k");
-    await client.switchSession(sessions[3]);
-    expect(formatContextUsage((await client.getSessionStats()).contextUsage)).toBe("8%/500k");
-  } finally {
-    await client.stop();
-    fs.rmSync(directory, { recursive: true, force: true });
-  }
-});
-
-test("context usage flows through public tools, child RPC, metadata and the detail footer only, including history", async () => {
-  process.env.PI_SUBAGENT_PI_BIN = FAKE_RPC_CHILD;
-  process.env.PI_SUBAGENT_TEST_MODEL_RESPONSES = JSON.stringify({
-    contextResponses: [10, 12, 14].map((percent) => ({
-      data: { tokens: { total: 999999 }, contextUsage: { tokens: percent * 5000, contextWindow: 500000, percent } },
-    })),
-    steerEvents: [{ event: { type: "turn_end" } }],
-  });
-  const parentId = `context-full-chain-${randomUUID()}`;
-  const scope = path.join(getRunsDir(), parentScopeKey(parentId));
+test("seven public tools carry native usage through metadata and the detail footer without consuming reads", async () => {
+  codingAgent.initTheme("dark", false);
+  fixture = configureCoreFixture({ tokens: (text) => text.includes("fourteen") ? 70000 : text.includes("twelve") ? 60000 : 50000 });
+  const parent = "public-sdk-chain-" + randomUUID();
   const tools = new Map<string, any>();
   const commands = new Map<string, any>();
   const handlers = new Map<string, any>();
+  const sent: any[] = [];
   const theme = { fg: (_color: string, text: string) => text, bold: (text: string) => text };
   const ctx: any = {
     mode: "tui", cwd: TEST_AGENT_DIR, model: { provider: "test", id: "fake" },
     modelRegistry: { getAvailable: () => [{ provider: "test", id: "fake" }] },
-    sessionManager: { getSessionId: () => parentId },
+    sessionManager: { getSessionId: () => parent },
     ui: { notify: mock(() => {}), setWidget() {} },
   };
-  const { default: extension } = await import("./index.js");
-  const execute = (name: string, params: any) => tools.get(name).execute("context-e2e", params, undefined, undefined, ctx);
+  const { default: extension } = await import("../src/index.js");
+  const execute = (name: string, params: any) => tools.get(name).execute("public-sdk-chain", params, undefined, undefined, ctx);
+  const done = (percent: number) => waitUntil(() => getAgent("worker", parent)?.status === "completed" && getAgent("worker", parent)?.contextUsage?.tokens === percent * 5000);
   try {
     await extension({
       on(name: string, handler: any) { handlers.set(name, handler); },
       registerTool(tool: any) { tools.set(tool.name, tool); },
       registerCommand(name: string, command: any) { commands.set(name, command); },
-      registerShortcut() {}, registerMessageRenderer() {}, sendMessage() {},
+      registerShortcut() {}, registerMessageRenderer() {}, sendMessage(message: any) { sent.push(message); },
       getThinkingLevel: () => "high", getActiveTools: () => ["read"],
       getSettings: () => ({ terminal: { showImages: false }, outputPad: 0 }),
     } as any);
     await handlers.get("session_start")({}, ctx);
-    const spawned = await execute("spawn_agent", { task_name: "worker", message: "hold context full chain" });
-    expect(spawned.content[0].text).toBe("Spawned /worker.");
-    await waitUntil(() => getAgent("worker", parentId)?.contextUsage?.percent === 10);
-    const overlayFrames: string[] = [];
-    let opened = 0;
+    expect([...tools.keys()]).toEqual(["spawn_agent", "wait_agent", "wait_all_agents", "list_agents", "read_agent_response", "send_message", "interrupt_agent"]);
+    expect((await execute("spawn_agent", { task_name: "worker", message: "sample ten" })).content[0].text).toBe("Spawned /worker.");
+    await done(10);
+    const beforeRead = sent.length;
+    const read = await execute("read_agent_response", { target: "worker" });
+    expect(read.content[0].text).toContain("response:sample ten");
+    expect(await execute("read_agent_response", { target: "worker" })).toEqual(read);
+    expect(sent).toHaveLength(beforeRead);
+    expect((await execute("wait_agent", { targets: ["worker"] })).content[0].text).toContain("response:sample ten");
+    expect((await execute("list_agents", {})).content[0].text).not.toContain("contextUsage");
+    let detailOpened = 0;
     ctx.ui.custom = async (create: any) => {
       let component: any;
       let result: any;
+      const frames: string[] = [];
       const tui = { terminal: { rows: 35 }, requestRender() {
-        if (!(component instanceof SubagentPeekOverlay)) return;
-        overlayFrames.push(stripVTControlCharacters(component.render(80).join("\n")));
+        if (component instanceof SubagentPeekOverlay) frames.push(stripVTControlCharacters(component.render(80).join("\n")));
       } };
       component = create(tui, theme, {}, (value: any) => { result = value; component.dispose?.(); });
       try {
-        if (!(component instanceof SubagentPeekOverlay)) {
-          const browserLines = component.render(80);
-          expect(browserLines.join("\n")).not.toMatch(/ctx |Context:|%\/500k/);
-          expect((await execute("send_message", { target: "worker", message: "sample twelve" })).details.delivery).toBe("steer");
-          await waitUntil(() => getAgent("worker", parentId)?.contextUsage?.percent === 12);
-          expect(component.render(80)).toBe(browserLines);
-          component.handleInput("\r");
-        } else {
-          opened++;
-          expect(component.render(80).at(-2)).toContain("│ 12%/500k │ ←/→ agent");
-          expect(component.render(80).join("\n")).not.toContain("Context:");
-          await execute("send_message", { target: "worker", message: "sample fourteen" });
-          await waitUntil(() => overlayFrames.some((frame) => frame.includes("│ 14%/500k │ ←/→ agent")));
-          component.handleInput("q");
-        }
-        return result;
-      } finally {
-        component.dispose?.();
-      }
-    };
-    await commands.get("subagents").handler("", ctx);
-    expect(opened).toBe(1);
-    expect((await execute("list_agents", {})).content[0].text).not.toContain("contextUsage");
-    expect((await execute("interrupt_agent", { target: "worker" })).details.previous_status).toBe("running");
-    const saved = getAgent("worker", parentId)!;
-    expect(saved.childProcess).toBeUndefined();
-    expect(saved.contextUsage).toEqual({ tokens: 70000, contextWindow: 500000, percent: 14 });
-    const beforeHistory = fs.readFileSync(saved.sessionFile, "utf8");
-    let historyOpened = 0;
-    ctx.ui.custom = async (create: any) => {
-      let component: any;
-      let result: any;
-      component = create({ terminal: { rows: 35 }, requestRender() {} }, theme, {}, (value: any) => {
-        result = value;
-        component.dispose?.();
-      });
-      try {
         if (component instanceof SubagentPeekOverlay) {
-          historyOpened++;
-          expect(component.render(80).at(-2)).toContain("│ 14%/500k │ ←/→ agent");
+          detailOpened++;
+          expect(component.render(80).at(-2)).toContain("│ 12%/500k │ ←/→ agent");
+          expect((await execute("send_message", { target: "worker", message: "sample fourteen" })).details.delivery).toBe("prompt");
+          await done(14);
+          await waitUntil(() => frames.some((frame) => frame.includes("│ 14%/500k │ ←/→ agent")));
           component.handleInput("q");
         } else {
           expect(component.render(80).join("\n")).not.toMatch(/ctx |Context:|%\/500k/);
+          expect((await execute("send_message", { target: "worker", message: "sample twelve" })).details.delivery).toBe("prompt");
+          await done(12);
           component.handleInput("\r");
         }
         return result;
       } finally { component.dispose?.(); }
     };
     await commands.get("subagents").handler("", ctx);
-    expect(historyOpened).toBe(1);
+    expect(detailOpened).toBe(1);
+    expect((await execute("wait_all_agents", { targets: ["worker"] })).content[0].text).toContain("response:sample fourteen");
+    const saved = getAgent("worker", parent)!;
+    expect(saved.contextUsage).toMatchObject({ tokens: 70000, contextWindow: 500000 });
+    expect(saved.contextUsage!.percent!).toBeCloseTo(14);
+    const beforeHistory = fs.readFileSync(saved.sessionFile, "utf8");
+    ctx.ui.custom = async (create: any) => {
+      let component: any;
+      let result: any;
+      component = create({ terminal: { rows: 35 }, requestRender() {} }, theme, {}, (value: any) => { result = value; component.dispose?.(); });
+      try {
+        if (component instanceof SubagentPeekOverlay) {
+          expect(component.render(80).at(-2)).toContain("│ 14%/500k │ ←/→ agent");
+          component.handleInput("q");
+        } else component.handleInput("\r");
+        return result;
+      } finally { component.dispose?.(); }
+    };
+    await commands.get("subagents").handler("", ctx);
     expect(fs.readFileSync(saved.sessionFile, "utf8")).toBe(beforeHistory);
-    expect(getAgent("worker", parentId)?.childProcess).toBeUndefined();
+    await execute("send_message", { target: "worker", message: "hold interrupt via tool" });
+    expect((await execute("interrupt_agent", { target: "worker" })).details.previous_status).toBe("running");
+    expect(getAgent("worker", parent)?.status).toBe("interrupted");
     expect(ctx.ui.notify).not.toHaveBeenCalled();
-  } finally {
-    await handlers.get("session_shutdown")?.();
-    fs.rmSync(scope, { recursive: true, force: true });
-    delete process.env.PI_SUBAGENT_PI_BIN;
-    delete process.env.PI_SUBAGENT_TEST_MODEL_RESPONSES;
+  } finally { await handlers.get("session_shutdown")?.(); }
+});
+describe("reviewed SDK lifecycle regressions", () => {
+  test("a failed final save still publishes status, wakes wait_agent, and exposes consumed-mailbox/disk inconsistency", async () => {
+    const gate = deferred();
+    fixture = configureCoreFixture({ responseGate: gate.promise });
+    const parent = "failed-final-save-wait-" + randomUUID();
+    const errors: Error[] = [];
+    const activity: boolean[] = [];
+    const notifications: any[] = [];
+    const manager = new AgentManager({ onError: (error) => errors.push(error),
+      onActivityChange: (event) => activity.push(event.active), onUnclaimedCompletion: (event) => notifications.push(event) });
+    const controller = new AbortController();
+    const deadline = setTimeout(() => controller.abort(), 2000);
+    let save: ReturnType<typeof spyOn> | undefined;
+    try {
+      await manager.spawnAgent(spawnParams(parent, "worker", "hold final save"));
+      await waitUntil(() => fixture.instances[0].activeStreams === 1);
+      const info = manager.getAgentInfo("worker", parent);
+      const rename = fs.renameSync;
+      save = spyOn(fs, "renameSync").mockImplementation((from, to) => {
+        if (String(to) === info.infoFile && JSON.parse(fs.readFileSync(String(from), "utf8")).status === "completed")
+          throw new Error("final status fixture save failure");
+        return rename(from, to);
+      });
+      const waiting = manager.waitAgent(parent, ["worker"], controller.signal);
+      gate.resolve();
+      expect((await waiting).event).toMatchObject({ status: "completed", finalResponse: "response:hold final save" });
+      await released(manager, info);
+      expect(activity.at(-1)).toBe(false);
+      expect(notifications).toEqual([]);
+      expect(errors.some((error) => error.message.includes("final status fixture save failure"))).toBe(true);
+      expect(manager.getAgentInfo("worker", parent).status).toBe("running");
+      expect(manager["live"].size).toBe(0);
+      expect(fs.existsSync(activeMarker(info.id))).toBe(false);
+      await expect(manager.waitAllAgents(parent, ["worker"], controller.signal)).rejects.toThrow(/persisted status|saved status|inconsistent/i);
+      expect(fixture.instances[0].shutdowns).toBe(1);
+    } finally { clearTimeout(deadline); controller.abort(); save?.mockRestore(); gate.resolve(); await manager.shutdown(); }
+  });
+
+  test("wait_all_agents uses an existing terminal mailbox event ahead of a stale running disk record", async () => {
+    const gate = deferred();
+    fixture = configureCoreFixture({ responseGate: gate.promise });
+    const parent = "failed-final-save-all-" + randomUUID();
+    const notifications: any[] = [];
+    const manager = new AgentManager({ onError() {}, onUnclaimedCompletion: (event) => notifications.push(event) });
+    const controller = new AbortController();
+    const deadline = setTimeout(() => controller.abort(), 2000);
+    let save: ReturnType<typeof spyOn> | undefined;
+    try {
+      await manager.spawnAgent(spawnParams(parent, "worker", "hold mailbox final"));
+      await waitUntil(() => fixture.instances[0].activeStreams === 1);
+      const info = manager.getAgentInfo("worker", parent);
+      const rename = fs.renameSync;
+      save = spyOn(fs, "renameSync").mockImplementation((from, to) => {
+        if (String(to) === info.infoFile && JSON.parse(fs.readFileSync(String(from), "utf8")).status === "completed")
+          throw new Error("final status fixture save failure");
+        return rename(from, to);
+      });
+      const waiting = manager.waitAllAgents(parent, ["worker"], controller.signal);
+      gate.resolve();
+      expect((await waiting).responses).toEqual([expect.objectContaining({ agent_name: "/worker", status: "completed", finalResponse: "response:hold mailbox final" })]);
+      await released(manager, info);
+      expect(notifications).toEqual([]);
+      expect(manager.getAgentInfo("worker", parent).status).toBe("running");
+      expect(manager["mailbox"].filter((event) => event.parentSessionId === parent)).toEqual([]);
+    } finally { clearTimeout(deadline); controller.abort(); save?.mockRestore(); gate.resolve(); await manager.shutdown(); }
+  });
+
+  test("unaccepted resume rejection wakes a waiter registered during native input with the old final event, without renotifying", async () => {
+    const gate = deferred();
+    const parent = "resume-waiter-rollback-" + randomUUID();
+    const notifications: any[] = [];
+    const manager = new AgentManager({ onUnclaimedCompletion: (event) => notifications.push(event) });
+    const controller = new AbortController();
+    const deadline = setTimeout(() => controller.abort(), 2000);
+    let resuming: Promise<unknown> | undefined;
+    try {
+      await manager.spawnAgent(spawnParams(parent, "worker", "first"));
+      const info = manager.getAgentInfo("worker", parent);
+      await released(manager, info);
+      expect(notifications).toHaveLength(1);
+      fixture = configureCoreFixture({ input: async () => { await gate.promise; } });
+      resuming = manager.sendMessage(parent, "worker", "not accepted").then(() => undefined, (error) => error);
+      await waitUntil(() => fixture.instances[0]?.inputs.length === 1);
+      const live = manager["live"].get(info.id)!;
+      // Reject at the real native auth preflight AFTER input returns, without a backend stub.
+      spyOn(live.session!.modelRuntime, "hasConfiguredAuth").mockReturnValue(false);
+      spyOn(live.session!.modelRuntime, "checkAuth").mockResolvedValue(undefined);
+      const waiting = manager.waitAgent(parent, ["worker"], controller.signal);
+      expect(manager["waiters"]).toHaveLength(1);
+      gate.resolve();
+      const error = await resuming as Error;
+      expect(error).toBeInstanceOf(Error);
+      expect(error.message).toMatch(/API key|authentication/i);
+      expect((await waiting).event).toMatchObject({ agentName: "/worker", status: "completed", finalResponse: "response:first" });
+      await released(manager, info);
+      expect(manager.getAgentInfo("worker", parent)).toMatchObject({ status: "completed", messageCount: 1, finalResponse: "response:first" });
+      expect(notifications).toHaveLength(1);
+      expect(fixture.instances[0].requests).toEqual([]);
+      expect(fixture.instances[0].shutdowns).toBe(1);
+    } finally { clearTimeout(deadline); controller.abort(); gate.resolve(); await resuming; await manager.shutdown(); }
+  });
+
+  describe("unaccepted resume completion state", () => {
+    function rejectAfterInput(manager: InstanceType<typeof AgentManager>, info: AgentInfo, gate: ReturnType<typeof deferred>) {
+      const entered = deferred();
+      fixture = configureCoreFixture({ input: async () => {
+        entered.resolve();
+        await gate.promise;
+        const session = manager["live"].get(info.id)!.session!;
+        session.modelRuntime.unregisterProvider(info.provider);
+        await session.modelRuntime.refresh({ allowNetwork: false });
+        // unregister also starts a native background refresh, which may finish last.
+        await waitUntil(() => !session.modelRuntime.hasConfiguredAuth(info.provider));
+      } });
+      const state = fixture;
+      const resuming = manager.sendMessage(info.parentSessionId, info.taskName, "unaccepted native input")
+        .then(() => undefined, (error) => error);
+      return { entered: entered.promise, resuming, state };
+    }
+
+    test.each(["wait_agent", "wait_all_agents"])("commits rollback before an activity callback consumes it with %s", async (consumer) => {
+      const gate = deferred();
+      const parent = "rollback-activity-consumer-" + randomUUID();
+      const notifications: any[] = [];
+      let observeRollback = false;
+      let callbackWait: Promise<any> | undefined;
+      const manager = new AgentManager({
+        onUnclaimedCompletion: (event) => notifications.push(event),
+        onActivityChange(event) {
+          if (!observeRollback || event.parentSessionId !== parent || event.active) return;
+          callbackWait = consumer === "wait_agent"
+            ? manager.waitAgent(parent, ["worker"])
+            : manager.waitAllAgents(parent, ["worker"]);
+        },
+      });
+      let resuming: Promise<unknown> | undefined;
+      try {
+        await manager.spawnAgent(spawnParams(parent, "worker", "first"));
+        const info = manager.getAgentInfo("worker", parent);
+        await released(manager, info);
+        const original = manager["mailbox"].find((event) => event.agentName === "/worker")!;
+        const rejected = rejectAfterInput(manager, info, gate);
+        resuming = rejected.resuming;
+        await rejected.entered;
+        observeRollback = true;
+        gate.resolve();
+        expect(await resuming).toBeInstanceOf(Error);
+        await released(manager, info);
+        expect(callbackWait).toBeDefined();
+        const result = await callbackWait;
+        if (consumer === "wait_agent") expect(result.event).toMatchObject({ id: original.id, finalResponse: "response:first" });
+        else expect(result.responses).toEqual([expect.objectContaining({ finalResponse: "response:first" })]);
+        expect(manager["mailbox"]).toEqual([]);
+        expect(manager["defaultWaitAllTargets"].get(parent)?.has("/worker") ?? false).toBe(false);
+        expect(notifications).toHaveLength(1);
+        expect(rejected.state.instances[0].requests).toEqual([]);
+      } finally {
+        observeRollback = false; gate.resolve(); await resuming; await callbackWait;
+        await manager.shutdown();
+      }
+    });
+
+    test.each(["wait_agent", "wait_all_agents"])("does not replay a completion already consumed by %s", async (consumer) => {
+      const gate = deferred();
+      const parent = "consumed-rollback-" + randomUUID();
+      const notifications: any[] = [];
+      const manager = new AgentManager({ onUnclaimedCompletion: (event) => notifications.push(event) });
+      const controller = new AbortController();
+      let resuming: Promise<unknown> | undefined;
+      let waiting: Promise<any> | undefined;
+      try {
+        await manager.spawnAgent(spawnParams(parent, "worker", "first"));
+        const info = manager.getAgentInfo("worker", parent);
+        await released(manager, info);
+        if (consumer === "wait_agent") await manager.waitAgent(parent, ["worker"]);
+        else await manager.waitAllAgents(parent, ["worker"]);
+        expect(manager["mailbox"]).toEqual([]);
+        const rejected = rejectAfterInput(manager, info, gate);
+        resuming = rejected.resuming;
+        await rejected.entered;
+        gate.resolve();
+        expect(await resuming).toBeInstanceOf(Error);
+        await released(manager, info);
+        expect(rejected.state.instances[0].requests).toEqual([]);
+        expect(manager["mailbox"]).toEqual([]);
+        expect(manager["defaultWaitAllTargets"].get(parent)?.has("/worker") ?? false).toBe(false);
+        expect((await manager.waitAllAgents(parent)).responses).toEqual([]);
+        expect(notifications).toHaveLength(1);
+        expect(manager.readAgentResponse("worker", parent).finalResponse).toBe("response:first");
+
+        // A next-completion wait still belongs to the next accepted turn, not the old one.
+        waiting = manager.waitAgent(parent, undefined, controller.signal);
+        expect(manager["waiters"]).toHaveLength(1);
+        fixture = configureCoreFixture();
+        await manager.sendMessage(parent, "worker", "second");
+        expect((await waiting).event).toMatchObject({ status: "completed", finalResponse: "response:second" });
+        await released(manager, info);
+        expect(notifications).toHaveLength(1);
+      } finally {
+        controller.abort(); gate.resolve(); await resuming; await waiting?.catch(() => {});
+        await manager.shutdown();
+      }
+    });
+
+    test("restores a targeted waiter without satisfying an unscoped next-completion waiter", async () => {
+      const gate = deferred();
+      const parent = "rollback-waiter-kinds-" + randomUUID();
+      const manager = new AgentManager();
+      const controller = new AbortController();
+      let resuming: Promise<unknown> | undefined;
+      let anyWait: Promise<any> | undefined;
+      let targetedWait: Promise<any> | undefined;
+      let anyResult: any;
+      let targetedResult: any;
+      try {
+        await manager.spawnAgent(spawnParams(parent, "worker", "first"));
+        const info = manager.getAgentInfo("worker", parent);
+        await released(manager, info);
+        await manager.waitAgent(parent, ["worker"]);
+        const rejected = rejectAfterInput(manager, info, gate);
+        resuming = rejected.resuming;
+        await rejected.entered;
+        anyWait = manager.waitAgent(parent, undefined, controller.signal)
+          .then((result) => { anyResult = result; return result; }, (error) => error);
+        targetedWait = manager.waitAgent(parent, ["worker"], controller.signal)
+          .then((result) => { targetedResult = result; return result; }, (error) => error);
+        expect(manager["waiters"]).toHaveLength(2);
+        gate.resolve();
+        expect(await resuming).toBeInstanceOf(Error);
+        await released(manager, info);
+        expect(anyResult).toBeUndefined();
+        expect(targetedResult?.event).toMatchObject({ status: "completed", finalResponse: "response:first" });
+        expect(manager["waiters"]).toHaveLength(1);
+        expect(manager["mailbox"]).toEqual([]);
+      } finally {
+        controller.abort(); gate.resolve(); await resuming; await anyWait; await targetedWait;
+        await manager.shutdown();
+      }
+    });
+
+    test.each(["during input", "after rejection", "interrupt"])("preserves wait-all notification ownership: %s", async (phase) => {
+      const responseA = deferred(), responseB = deferred(), input = deferred();
+      const parent = "rollback-claims-" + randomUUID();
+      const notifications: any[] = [];
+      const manager = new AgentManager({ onUnclaimedCompletion: (event) => notifications.push(event) });
+      const first = new AbortController(), second = new AbortController();
+      let firstWait: Promise<any> | undefined, secondWait: Promise<any> | undefined;
+      let resuming: Promise<unknown> | undefined;
+      try {
+        fixture = configureCoreFixture({ responseGate: responseA.promise });
+        await manager.spawnAgent(spawnParams(parent, "a", "hold result A"));
+        const infoA = manager.getAgentInfo("a", parent);
+        fixture = configureCoreFixture({ responseGate: responseB.promise });
+        await manager.spawnAgent(spawnParams(parent, "b", "hold result B"));
+        firstWait = manager.waitAllAgents(parent, ["a", "b"], first.signal).catch((error) => error);
+        secondWait = manager.waitAllAgents(parent, ["a", "b"], second.signal).catch((error) => error);
+        responseA.resolve();
+        await released(manager, infoA);
+        const originalEvent = manager["mailbox"].find((event) => event.agentName === "/a")!;
+        expect(originalEvent).toBeDefined();
+        expect([...manager["waitAllClaims"]].every((claim) => claim.suppressedEventIds.has(originalEvent.id))).toBe(true);
+        expect(notifications).toEqual([]);
+
+        const rejected = rejectAfterInput(manager, infoA, input);
+        resuming = rejected.resuming;
+        await rejected.entered;
+        first.abort(new Error("first claim canceled"));
+        expect(await firstWait).toBeInstanceOf(Error);
+        expect(notifications).toEqual([]); // The second claim still owns the notification.
+
+        if (phase === "during input") {
+          second.abort(new Error("last claim canceled during input"));
+          expect(await secondWait).toBeInstanceOf(Error);
+          expect(notifications).toEqual([expect.objectContaining({ id: originalEvent.id, agentName: "/a" })]);
+        }
+        if (phase === "interrupt") {
+          const interrupting = manager.interruptAgent(parent, "a");
+          await waitUntil(() => manager.getAgentInfo("a", parent).status === "interrupted");
+          input.resolve();
+          await interrupting;
+        } else input.resolve();
+        expect(await resuming).toBeInstanceOf(Error);
+        await released(manager, infoA);
+
+        const currentEvent = manager["mailbox"].find((event) => event.agentName === "/a")!;
+        if (phase === "interrupt") {
+          expect(currentEvent).toMatchObject({ status: "interrupted" });
+          expect(currentEvent.id).not.toBe(originalEvent.id);
+        } else {
+          expect(currentEvent).toBe(originalEvent);
+          expect(rejected.state.instances[0].requests).toEqual([]);
+        }
+        if (phase !== "during input") {
+          second.abort(new Error("last claim canceled"));
+          expect(await secondWait).toBeInstanceOf(Error);
+        }
+        expect(notifications).toEqual(phase === "interrupt" ? [] : [
+          expect.objectContaining({ id: originalEvent.id, agentName: "/a", finalResponse: "response:hold result A" }),
+        ]);
+      } finally {
+        first.abort(); second.abort(); input.resolve(); responseA.resolve(); responseB.resolve();
+        await resuming; await firstWait; await secondWait; await manager.shutdown();
+      }
+    });
+  });
+
+  test.each(["before", "after"])("a compaction-only busy session cannot report steer acceptance (%s await)", async (phase) => {
+    const gate = deferred();
+    const parent = "compaction-only-steer-" + phase + "-" + randomUUID();
+    const manager = new AgentManager();
+    let session: any;
+    let steer: ReturnType<typeof spyOn> | undefined;
+    try {
+      await manager.spawnAgent(spawnParams(parent, "worker", "hold run"));
+      await waitUntil(() => fixture.instances[0].activeStreams === 1);
+      const info = manager.getAgentInfo("worker", parent);
+      session = manager["live"].get(info.id)!.session!;
+      const compactionOnly = () => {
+        // Public state getters reproduce the native manual-compaction-only gap:
+        // not idle does NOT imply an agent stream to which steering can be delivered.
+        Object.defineProperty(session, "isStreaming", { configurable: true, get: () => false });
+        Object.defineProperty(session, "isIdle", { configurable: true, get: () => false });
+      };
+      if (phase === "before") {
+        compactionOnly();
+        steer = spyOn(session, "steer");
+        await expect(manager.sendMessage(parent, "worker", "must not queue")).rejects.toThrow(/finishing|stream|running|delivery/i);
+        expect(steer).not.toHaveBeenCalled();
+      } else {
+        steer = spyOn(session, "steer").mockImplementation(async () => { await gate.promise; compactionOnly(); return "queued"; });
+        const pending = manager.sendMessage(parent, "worker", "must not claim delivery").then(() => undefined, (error) => error);
+        await waitUntil(() => manager["live"].get(info.id)!.pendingSteers.size === 1);
+        gate.resolve();
+        expect(await pending).toBeInstanceOf(Error);
+        expect(manager.getAgentInfo("worker", parent).lastTaskMessage).toBe("hold run");
+      }
+      expect(fixture.instances).toHaveLength(1);
+    } finally {
+      gate.resolve(); steer?.mockRestore();
+      if (session) { delete session.isStreaming; delete session.isIdle; }
+      await manager.shutdown();
+    }
+  });
+
+  test("an extension recovery after an aborted settled boundary uses the final successful settled result", async () => {
+    let recovered = false;
+    fixture = configureCoreFixture({ onSettled(aborted, pi) {
+      if (aborted && !recovered) {
+        recovered = true;
+        pi.sendUserMessage("recovered successfully");
+      }
+    } });
+    const parent = "aborted-settled-recovery-" + randomUUID();
+    const notifications: any[] = [];
+    const manager = new AgentManager({ onUnclaimedCompletion: (event) => notifications.push(event) });
+    try {
+      await manager.spawnAgent(spawnParams(parent, "worker", "hold original"));
+      await waitUntil(() => fixture.instances[0].activeStreams === 1);
+      const info = manager.getAgentInfo("worker", parent);
+      const session = manager["live"].get(info.id)!.session!;
+      // Only abort native work: manager interrupt would intentionally own the terminal status.
+      await session.abort();
+      await released(manager, info);
+      expect(fixture.instances[0].events.filter((event) => event.startsWith("settled:"))).toEqual(["settled:aborted", "settled:success"]);
+      expect(manager.readAgentResponse("worker", parent)).toMatchObject({ status: "completed", finalResponse: "response:recovered successfully" });
+      expect(notifications).toEqual([expect.objectContaining({ status: "completed", finalResponse: "response:recovered successfully" })]);
+      expect(fixture.instances[0].shutdowns).toBe(1);
+      expect(fixture.instances[0].requests.map((request) => request.text)).toEqual(["hold original", "recovered successfully"]);
+    } finally { await manager.shutdown(); }
+  });
+});
+
+describe("SDK cleanup ownership regressions", () => {
+  // Keep every logger stream, including any orphan no longer reachable through logger.stream.
+  function trackLogStreams() {
+    const streams: fs.WriteStream[] = [];
+    const create = fs.createWriteStream;
+    const spy = spyOn(fs, "createWriteStream").mockImplementation((file, options) => {
+      const stream = create(file, options);
+      if (String(file).endsWith(".log")) streams.push(stream);
+      return stream;
+    });
+    return {
+      streams,
+      async cleanup() {
+        try {
+          for (const stream of streams) {
+            if (stream.closed) continue;
+            const closed = once(stream, "close");
+            stream.destroy();
+            await closed.catch(() => {});
+          }
+        } finally { spy.mockRestore(); }
+      },
+    };
   }
+
+  test("R1: startup abort reentry owns one cleanup chain until idempotent extension shutdown releases", async () => {
+    const failStartup = deferred();
+    const shutdownGate = deferred();
+    const tracked = trackLogStreams();
+    const parent = "reentrant-cleanup-owner-" + randomUUID();
+    const manager = new AgentManager({ onError() {} });
+    let timer: ReturnType<typeof setInterval> | undefined;
+    let armed = false;
+    let registeredBeforeAbort = false;
+    let closing = false;
+    let activeResources = 0;
+    let freedResources = 0;
+    let startupFailure: unknown;
+    let pending: Promise<unknown> | undefined;
+    let termination: Promise<void> | undefined;
+    let dispose: ReturnType<typeof spyOn> | undefined;
+    const firstFixture = fixture = configureCoreFixture({
+      async onStart(pi, ctx) {
+        timer = setInterval(() => {}, 1000);
+        activeResources++;
+        // Real extension-owned work creates the native signal during session_start.
+        pi.sendUserMessage("hold startup-owned work");
+        await waitUntil(() => Boolean(ctx.signal), 2000);
+        ctx.signal!.addEventListener("abort", () => {
+          registeredBeforeAbort = Boolean([...manager["live"].values()][0]?.termination);
+          ctx.shutdown(); // Native abort listeners run synchronously, reentering termination.
+        }, { once: true });
+        armed = true;
+        await failStartup.promise;
+        throw new Error("cleanup ownership startup failure");
+      },
+      async onShutdown() {
+        // A conventional idempotent hook: a second invocation returns while the first waits.
+        if (closing) return;
+        closing = true;
+        await shutdownGate.promise;
+        clearInterval(timer);
+        activeResources--;
+        freedResources++;
+      },
+    });
+    try {
+      pending = manager.spawnAgent(spawnParams(parent, "worker", "not yet submitted")).catch((error) => {
+        startupFailure = error;
+        return error;
+      });
+      await waitUntil(() => startupFailure !== undefined || (armed && firstFixture.instances[0]?.activeStreams === 1), 2000);
+      if (startupFailure !== undefined) throw startupFailure;
+      const info = manager.getAgentInfo("worker", parent);
+      const live = manager["live"].get(info.id)!;
+      dispose = spyOn(live.session!, "dispose");
+      failStartup.resolve();
+      await waitUntil(() => firstFixture.instances[0].shutdowns > 0);
+      termination = live.termination;
+      expect({
+        registeredBeforeAbort,
+        shutdowns: firstFixture.instances[0].shutdowns,
+        disposals: dispose.mock.calls.length,
+        liveRetained: manager["live"].get(info.id) === live,
+        markerRetained: fs.existsSync(activeMarker(info.id)),
+        activeResources,
+        freedResources,
+      }).toEqual({
+        registeredBeforeAbort: true, shutdowns: 1, disposals: 0,
+        liveRetained: true, markerRetained: true, activeResources: 1, freedResources: 0,
+      });
+      expect(manager["terminateSession"](live)).toBe(termination);
+      await expect(manager.sendMessage(parent, "worker", "must not reopen the JSONL")).rejects.toThrow(/closing|finishing/i);
+      expect(firstFixture.instances).toHaveLength(1);
+
+      shutdownGate.resolve();
+      const error = await pending as Error;
+      expect(error).toBeInstanceOf(Error);
+      expect(error.message).toContain("cleanup ownership startup failure");
+      await released(manager, info);
+      expect(firstFixture.instances[0].shutdowns).toBe(1);
+      expect(dispose).toHaveBeenCalledTimes(1);
+      expect([activeResources, freedResources]).toEqual([0, 1]);
+      expect(fs.existsSync(activeMarker(info.id))).toBe(false);
+
+      fixture = configureCoreFixture();
+      await manager.sendMessage(parent, "worker", "reopen only after actual cleanup");
+      await released(manager, info);
+      expect(manager.getAgentInfo("worker", parent).sessionFile).toBe(info.sessionFile);
+      expect(fixture.instances[0].shutdowns).toBe(1);
+      expect(dispose).toHaveBeenCalledTimes(1);
+    } finally {
+      failStartup.resolve(); shutdownGate.resolve(); clearInterval(timer);
+      try {
+        await pending;
+        await termination?.catch(() => {});
+        await manager.shutdown();
+      } finally { dispose?.mockRestore(); await tracked.cleanup(); }
+    }
+  });
+
+  test("R3: logging works while closing, but a closed logger stays inert when a new session appends", async () => {
+    const responseGate = deferred();
+    const shutdownGate = deferred();
+    fixture = configureCoreFixture({ responseGate: responseGate.promise, shutdownGate: shutdownGate.promise });
+    const tracked = trackLogStreams();
+    const parent = "logger-close-owner-" + randomUUID();
+    const manager = new AgentManager();
+    try {
+      await manager.spawnAgent(spawnParams(parent, "worker", "hold logger run"));
+      const info = manager.getAgentInfo("worker", parent);
+      const live = manager["live"].get(info.id)!;
+      live.logger.info("regression", "normal write");
+      expect(tracked.streams).toHaveLength(1);
+      const original = tracked.streams[0];
+
+      responseGate.resolve();
+      await waitUntil(() => fixture.instances[0].shutdowns === 1);
+      expect(live.closing).toBe(true);
+      expect(original.writableEnded).toBe(false);
+      live.logger.info("regression", "closing write");
+      expect(tracked.streams).toHaveLength(1);
+      shutdownGate.resolve();
+      await released(manager, info);
+      await waitUntil(() => original.closed);
+      live.logger.close();
+      live.logger.close();
+      const mkdir = spyOn(fs, "mkdirSync");
+      let mkdirCalls = -1;
+      try {
+        live.logger.info("regression", "must not write after close");
+        mkdirCalls = mkdir.mock.calls.length;
+      } finally { mkdir.mockRestore(); }
+
+      fixture = configureCoreFixture();
+      await manager.sendMessage(parent, "worker", "hold restored logger");
+      const restored = manager["live"].get(info.id)!;
+      expect(restored.logger).not.toBe(live.logger);
+      restored.logger.info("regression", "restored append");
+      const restoredStream = tracked.streams.at(-1)!;
+      await manager.interruptAgent(parent, "worker");
+      await released(manager, info);
+      await waitUntil(() => restoredStream.closed);
+      expect(mkdirCalls).toBe(0);
+      expect(tracked.streams).toHaveLength(2);
+      expect(tracked.streams.every((stream) => stream.closed)).toBe(true);
+      const messages = fs.readFileSync(info.logFile, "utf8").trim().split("\n").map((line) => JSON.parse(line))
+        .filter((entry) => entry.category === "regression").map((entry) => entry.message);
+      expect(messages).toEqual(["normal write", "closing write", "restored append"]);
+    } finally {
+      responseGate.resolve(); shutdownGate.resolve();
+      try { await manager.shutdown(); } finally { await tracked.cleanup(); }
+    }
+  });
+
+  test("R3: repeated close before the first write cannot mkdir or create a stream", async () => {
+    const gate = deferred();
+    fixture = configureCoreFixture({ responseGate: gate.promise });
+    const tracked = trackLogStreams();
+    const manager = new AgentManager();
+    const parent = "logger-never-opened-" + randomUUID();
+    try {
+      await manager.spawnAgent(spawnParams(parent, "worker", "hold never logged"));
+      const info = manager.getAgentInfo("worker", parent);
+      const logger = manager["live"].get(info.id)!.logger;
+      expect(tracked.streams).toHaveLength(0);
+      logger.close();
+      logger.close();
+      const mkdir = spyOn(fs, "mkdirSync");
+      try {
+        logger.info("regression", "must stay unopened");
+        expect(mkdir).not.toHaveBeenCalled();
+        expect(tracked.streams).toHaveLength(0);
+        expect(logger["stream"]).toBeNull();
+      } finally { mkdir.mockRestore(); }
+    } finally {
+      gate.resolve();
+      try { await manager.shutdown(); } finally { await tracked.cleanup(); }
+    }
+  });
+
+  test.each(["onError", "console"] as const)("R3: shutdown timeout and late hook errors reach %s without reopening any log stream", async (sink) => {
+    const gate = deferred();
+    const lateError = "late cleanup hook failure " + sink;
+    fixture = configureCoreFixture({ shutdownGate: gate.promise, onShutdown() { throw new Error(lateError); } });
+    const tracked = trackLogStreams();
+    const hostErrors: string[] = [];
+    const consoleSpy = sink === "console" ? spyOn(console, "error").mockImplementation((...args: any[]) => {
+      hostErrors.push(args.join(" "));
+    }) : undefined;
+    const originalTimeout = globalThis.setTimeout;
+    // Accelerate only the existing shutdown hook deadline; no production injection interface.
+    const timers = spyOn(globalThis, "setTimeout").mockImplementation(((callback: any, ms: number, ...args: any[]) =>
+      originalTimeout(callback, ms === 5000 ? 100 : ms, ...args)) as typeof setTimeout);
+    const manager = new AgentManager(sink === "onError" ? { onError: (error) => hostErrors.push(error.message) } : {});
+    const parent = "logger-late-cleanup-" + randomUUID();
+    let dispose: ReturnType<typeof spyOn> | undefined;
+    try {
+      await manager.spawnAgent(spawnParams(parent, "worker", "first"));
+      const info = manager.getAgentInfo("worker", parent);
+      const live = manager["live"].get(info.id)!;
+      dispose = spyOn(live.session!, "dispose");
+      live.logger.info("regression", "before shutdown deadline");
+      expect(tracked.streams).toHaveLength(1);
+      const original = tracked.streams[0];
+      await waitUntil(() => fixture.instances[0].shutdowns === 1);
+      await released(manager, info);
+      await waitUntil(() => hostErrors.some((message) => message.includes("session_shutdown timed out")));
+      gate.resolve();
+      await waitUntil(() => hostErrors.some((message) => message.includes(lateError)));
+      await waitUntil(() => original.closed);
+      expect(dispose).toHaveBeenCalledTimes(1);
+      expect(fixture.instances[0].shutdowns).toBe(1);
+      expect(manager.readAgentResponse("worker", parent).status).toBe("completed");
+      expect(fs.existsSync(activeMarker(info.id))).toBe(false);
+      expect({
+        createdStreams: tracked.streams.length,
+        openStreams: tracked.streams.filter((stream) => !stream.closed).length,
+        loggerRetainsStream: live.logger["stream"] !== null,
+      }).toEqual({ createdStreams: 1, openStreams: 0, loggerRetainsStream: false });
+    } finally {
+      gate.resolve();
+      try { await manager.shutdown(); } finally {
+        dispose?.mockRestore(); timers.mockRestore(); consoleSpy?.mockRestore();
+        await tracked.cleanup();
+      }
+    }
+  });
 });

@@ -31,8 +31,8 @@ import { EventEmitter } from "node:events";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { stripVTControlCharacters } from "node:util";
-import { SubagentPeekOverlay } from "./peek.js";
-import type { AgentInfo } from "./core.js";
+import { SubagentPeekOverlay } from "../src/peek.js";
+import type { AgentInfo } from "../src/core.js";
 
 const widths = [38, 80, 100];
 const cwd = process.cwd();
